@@ -148,7 +148,7 @@ for inbound in config.get('inbounds', []):
     itype = inbound.get('type')
     port  = inbound.get('listen_port')
     tag   = inbound.get('tag', '').replace('-sb', '')
-    label = f"{tag}-{hostname}"
+    label = f"{tag}-{hostname}-备用IP"
     tls   = inbound.get('tls', {})
     sni   = tls.get('server_name', common_sni) or common_sni
 
@@ -176,7 +176,7 @@ for inbound in config.get('inbounds', []):
         tls_on    = tls.get('enabled', False)
         vmess_obj = {
             "v":        "2",
-            "ps":       f"vm-ws-{hostname}",
+            "ps":       f"vm-ws-{hostname}-备用IP",
             "add":      public_ip,
             "port":     str(port),
             "id":       uuid,
