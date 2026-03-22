@@ -29,7 +29,8 @@ echo "✅ 成功获取内网锚点 IP: $ANCHOR_IP"
 SOURCE_FILE="/etc/s-box/sb.json"
 TARGET_FILE="/etc/s-box/sb-reserved.json"
 
-if[ ! -f "$SOURCE_FILE" ]; then
+# 【修复】：补充了 if 和 [ 之间的空格
+if [ ! -f "$SOURCE_FILE" ]; then
     echo "❌ 错误：找不到原配置文件 $SOURCE_FILE，请先使用甬哥脚本完成基础部署。"
     exit 1
 fi
