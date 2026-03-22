@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # ====================================================
 # DigitalOcean 双开保留 IP 一键配置脚本 (适配 Ubuntu 24.04)
 # 作用: 自动读取 DO Anchor IP，端口自动+1，自动绑定出站网卡，注册双开服务
@@ -29,7 +28,6 @@ echo "✅ 成功获取内网锚点 IP: $ANCHOR_IP"
 SOURCE_FILE="/etc/s-box/sb.json"
 TARGET_FILE="/etc/s-box/sb-reserved.json"
 
-# 【修复】：补充了 if 和 [ 之间的空格
 if [ ! -f "$SOURCE_FILE" ]; then
     echo "❌ 错误：找不到原配置文件 $SOURCE_FILE，请先使用甬哥脚本完成基础部署。"
     exit 1
@@ -38,13 +36,13 @@ fi
 # 4. 利用内嵌 Python 脚本自动修改 JSON 配置
 echo "⚙️  正在生成端口+1并绑定 $ANCHOR_IP 的专属配置文件..."
 
-python3 -c "
+python3 - "$SOURCE_FILE" "$TARGET_FILE" "$ANCHOR_IP" <<'EOF'
 import json
 import sys
 
-source_file = '$SOURCE_FILE'
-target_file = '$TARGET_FILE'
-anchor_ip = '$ANCHOR_IP'
+source_file = sys.argv[1]
+target_file = sys.argv[2]
+anchor_ip   = sys.argv[3]
 
 try:
     with open(source_file, 'r', encoding='utf-8') as f:
@@ -59,20 +57,24 @@ if 'inbounds' in config:
         if 'listen_port' in inbound and isinstance(inbound['listen_port'], int):
             old_port = inbound['listen_port']
             inbound['listen_port'] = old_port + 1
-            print(f\"✅ 端口自动修改成功: {old_port} -> {inbound['listen_port']}\")
+            print(f"✅ 端口自动修改成功: {old_port} -> {inbound['listen_port']}")
 
 # 绑定网卡与 UDP 优化
 if 'outbounds' in config:
+    modified = False
     for outbound in config['outbounds']:
         if outbound.get('tag') == 'direct' and outbound.get('type') == 'direct':
             outbound['inet4_bind_address'] = anchor_ip
             outbound['udp_fragment'] = True
-            print(f\"✅ 出站网卡绑定成功: 锁定至 {anchor_ip}\")
+            print(f"✅ 出站网卡绑定成功: 锁定至 {anchor_ip}")
+            modified = True
             break
+    if not modified:
+        print("⚠️ 警告：未找到 tag='direct' 的出站规则，请手动检查。")
 
 with open(target_file, 'w', encoding='utf-8') as f:
     json.dump(config, f, indent=4, ensure_ascii=False)
-"
+EOF
 
 if [ $? -ne 0 ]; then
     echo "❌ 配置文件生成失败，请检查上面输出的错误。"
@@ -90,8 +92,7 @@ if [ ! -f "$SERVICE_SOURCE" ]; then
     exit 1
 fi
 
-# 替换配置路径并输出为新服务
-sed 's/sb.json/sb-reserved.json/g' "$SERVICE_SOURCE" > "$SERVICE_TARGET"
+sed 's/sb\.json/sb-reserved.json/g' "$SERVICE_SOURCE" > "$SERVICE_TARGET"
 
 # 6. 重载并启动服务
 systemctl daemon-reload
