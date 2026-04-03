@@ -41,26 +41,20 @@ SB_VERSION=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' || ec
 SB_MM=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' | cut -d'.' -f1,2 || echo "0.0")
 echo "📌 sing-box: $SINGBOX_BIN (v$SB_VERSION)"
 
-# ── 彻底停止所有副实例（防端口冲突）─────────────────────────
+# ── 彻底停止所有副实例 ───────────────────────────────────────
 echo ""
 echo "🔄 彻底停止所有副实例..."
 
-# 第一步: systemctl 停止
-for svc in sing-box-reserved-v4 sing-box-ipv6 sing-box-reserved-v6; do
+for svc in sing-box-reserved-v4 sing-box-ipv6 sing-box-reserved-v6 sing-box-reserved; do
     systemctl stop "$svc" 2>/dev/null || true
     systemctl disable "$svc" 2>/dev/null || true
 done
 
-# 第二步: 杀掉所有使用副配置文件的 sing-box 进程
-for cfg in sb-reserved-v4.json sb-ipv6.json sb-reserved-v6.json; do
+for cfg in sb-reserved-v4.json sb-ipv6.json sb-reserved-v6.json sb-reserved.json; do
     pids=$(ps aux 2>/dev/null | grep "[s]ing-box.*${cfg}" | awk '{print $2}' || true)
-    if [ -n "$pids" ]; then
-        echo "   ├─ 杀掉 $cfg 的残留进程: $pids"
-        echo "$pids" | xargs kill -9 2>/dev/null || true
-    fi
+    [ -n "$pids" ] && echo "   ├─ 杀掉 $cfg 残留进程: $pids" && echo "$pids" | xargs kill -9 2>/dev/null || true
 done
 
-# 第三步: 读取原始配置获取基础端口，检查+1/+2/+3端口是否被占用
 if [ -f /etc/s-box/sb.json ]; then
     BASE_PORTS=$(python3 -c "
 import json
@@ -68,30 +62,24 @@ with open('/etc/s-box/sb.json') as f:
     cfg = json.load(f)
 for ib in cfg.get('inbounds', []):
     p = ib.get('listen_port')
-    if p and isinstance(p, int):
-        print(p)
+    if p and isinstance(p, int): print(p)
 " 2>/dev/null || true)
 
     if [ -n "$BASE_PORTS" ]; then
+        main_pid=$(systemctl show -p MainPID sing-box 2>/dev/null | cut -d= -f2 || echo "0")
         for base_port in $BASE_PORTS; do
             for offset in 1 2 3; do
                 check_port=$((base_port + offset))
-                # 查找占用该端口的进程（排除主 sing-box 实例）
-                occupying_pids=$(ss -tlnp 2>/dev/null | grep ":${check_port} " | grep -oP 'pid=\K[0-9]+' | sort -u || true)
-                if [ -z "$occupying_pids" ]; then
-                    occupying_pids=$(ss -ulnp 2>/dev/null | grep ":${check_port} " | grep -oP 'pid=\K[0-9]+' | sort -u || true)
-                fi
-                if [ -n "$occupying_pids" ]; then
-                    # 获取主 sing-box 的 PID，避免误杀
-                    main_pid=$(systemctl show -p MainPID sing-box 2>/dev/null | cut -d= -f2 || echo "0")
+                for proto in t u; do
+                    occupying_pids=$(ss -${proto}lnp 2>/dev/null | grep ":${check_port} " | grep -oP 'pid=\K[0-9]+' | sort -u || true)
                     for pid in $occupying_pids; do
-                        if [ "$pid" != "$main_pid" ] && [ "$pid" != "0" ]; then
-                            proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
-                            echo "   ├─ 端口 $check_port 被 PID $pid ($proc_name) 占用，强制杀掉"
+                        if [ "$pid" != "$main_pid" ] && [ "$pid" != "0" ] && [ -n "$pid" ]; then
+                            proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "?")
+                            echo "   ├─ 端口 $check_port 被 PID $pid ($proc_name) 占用，杀掉"
                             kill -9 "$pid" 2>/dev/null || true
                         fi
                     done
-                fi
+                done
             done
         done
     fi
@@ -141,7 +129,6 @@ printf "│ 保留IPv6激活    : %-38s│\n" "${RESERVED_IPV6_ACTIVE:-⚠️}"
 printf "│ 标签/版本       : %-38s│\n" "$HOSTNAME_LABEL / v$SB_VERSION"
 echo "└──────────────────────────────────────────────────────────┘"
 
-# ── 验证 ─────────────────────────────────────────────────────
 ERRORS=(); WARNINGS=()
 [ -z "$MAIN_PUBLIC_IPV4" ] && ERRORS+=("主IPv4不可用")
 [ -z "$MAIN_IPV6" ] && ERRORS+=("主IPv6不可用")
@@ -322,6 +309,11 @@ def apply_ipv6(cfg, bind_v6):
     cfg.pop('endpoints', None)
     return cfg
 
+# ═══════════════════════════════════════════════════════════
+# generated 元组: (iid, filepath, config, connect_ip, label, egress_type, egress_ip)
+# egress_type: "ipv4" 或 "ipv6"
+# egress_ip: 实际出口IP地址
+# ═══════════════════════════════════════════════════════════
 generated = []
 
 if has_rv4 and anchor_ipv4:
@@ -338,7 +330,7 @@ if has_rv4 and anchor_ipv4:
     fp = f"{CONFIG_DIR}/sb-reserved-v4.json"
     with open(fp, 'w') as f: json.dump(c, f, indent=4, ensure_ascii=False)
     print(f"      ✅ {fp}")
-    generated.append(("reserved-v4", fp, c, reserved_ipv4, "保留IPv4"))
+    generated.append(("reserved-v4", fp, c, reserved_ipv4, "保留IPv4", "ipv4", reserved_ipv4))
 else:
     print("\n⏭️  实例2: 跳过")
 
@@ -348,7 +340,7 @@ apply_ipv6(c, main_ipv6)
 fp = f"{CONFIG_DIR}/sb-ipv6.json"
 with open(fp, 'w') as f: json.dump(c, f, indent=4, ensure_ascii=False)
 print(f"      ✅ {fp}")
-generated.append(("ipv6", fp, c, main_public_ipv4, "主IPv6"))
+generated.append(("ipv6", fp, c, main_public_ipv4, "主IPv6", "ipv6", main_ipv6))
 
 if has_rv6 and reserved_ipv6:
     print(f"\n📋 实例4: 保留IPv6 (端口+3, 绑定: {reserved_ipv6})")
@@ -357,10 +349,11 @@ if has_rv6 and reserved_ipv6:
     fp = f"{CONFIG_DIR}/sb-reserved-v6.json"
     with open(fp, 'w') as f: json.dump(c, f, indent=4, ensure_ascii=False)
     print(f"      ✅ {fp}")
-    generated.append(("reserved-v6", fp, c, main_public_ipv4, "保留IPv6"))
+    generated.append(("reserved-v6", fp, c, main_public_ipv4, "保留IPv6", "ipv6", reserved_ipv6))
 else:
     print("\n⏭️  实例4: 跳过")
 
+# ═══════════════════════════════════════════════════════════
 common_sni = get_common_sni(original_config)
 
 def gen_links(cfg, ip, suffix):
@@ -387,37 +380,48 @@ def gen_links(cfg, ip, suffix):
             links.append(('AnyTLS', f"anytls://{ib['users'][0]['password']}@{ip}:{p}?security=tls&sni={sni}&insecure=1&allowInsecure=1&type=tcp#{lbl}"))
     return links
 
+# ═══════════════════════════════════════════════════════════
+# 构建 sections，使用明确的 egress_type 和 egress_ip
+# ═══════════════════════════════════════════════════════════
 sections = []
-sections.append(("实例1-主IPv4", f"出口: {main_public_ipv4}", gen_links(original_config, main_public_ipv4, "主IPv4")))
-for iid, ifile, icfg, iip, ilabel in generated:
-    ll = gen_links(icfg, iip, ilabel)
-    if "ipv6" in iid:
-        v6a = reserved_ipv6 if "reserved" in iid else main_ipv6
-        info = f"入口: {main_public_ipv4} → 出口: {v6a}"
+sections.append(("实例1-主IPv4", f"入口: {main_public_ipv4} | 出口: {main_public_ipv4}", gen_links(original_config, main_public_ipv4, "主IPv4")))
+
+for iid, ifile, icfg, connect_ip, ilabel, egress_type, egress_ip in generated:
+    ll = gen_links(icfg, connect_ip, ilabel)
+    if egress_type == "ipv6":
+        info = f"入口: {main_public_ipv4} | 出口IPv6: {egress_ip}"
     else:
-        info = f"出口: {iip}"
+        info = f"入口: {reserved_ipv4} | 出口: {egress_ip}"
     sections.append((f"实例-{ilabel}", info, ll))
 
+# ── 输出完整链接（不截断）──────────────────────────────────
 for sn, si, sl in sections:
-    print(f"\n{'='*60}\n  📡 {sn} | {si}\n{'='*60}")
+    print(f"\n{'='*60}")
+    print(f"  📡 {sn}")
+    print(f"  {si}")
+    print(f"{'='*60}")
     for n, l in sl:
-        print(f"  📌 {n}: {l[:90]}..." if len(l) > 100 else f"  📌 {n}: {l}")
+        print(f"\n  📌 {n}:")
+        print(f"  {l}")
 
+# ── 保存 ────────────────────────────────────────────────────
 lf = f"{CONFIG_DIR}/all-links.txt"
 with open(lf, 'w') as f:
-    f.write(f"# DO四出口 | {hostname} | IPv4:{main_public_ipv4} | IPv6:{main_ipv6}\n\n")
+    f.write(f"# DO四出口 | {hostname}\n")
+    f.write(f"# 主IPv4: {main_public_ipv4} | 保留IPv4: {reserved_ipv4}\n")
+    f.write(f"# 主IPv6: {main_ipv6} | 保留IPv6: {reserved_ipv6}\n\n")
     for sn, si, sl in sections:
-        f.write(f"{'#'*60}\n# {sn} | {si}\n{'#'*60}\n\n")
+        f.write(f"{'#'*60}\n# {sn}\n# {si}\n{'#'*60}\n\n")
         for n, l in sl: f.write(f"# {n}\n{l}\n\n")
 print(f"\n💾 {lf}")
 
 for i, (sn, si, sl) in enumerate(sections, 1):
     with open(f"{CONFIG_DIR}/links-instance{i}.txt", 'w') as f:
-        f.write(f"# {sn} | {si}\n\n")
+        f.write(f"# {sn}\n# {si}\n\n")
         for n, l in sl: f.write(f"# {n}\n{l}\n\n")
 
 with open(f"{CONFIG_DIR}/.generated_instances", 'w') as f:
-    for iid, ifile, _, _, ilabel in generated:
+    for iid, ifile, _, _, ilabel, _, _ in generated:
         f.write(f"{iid}|{ifile}|{ilabel}\n")
 PYEOF
 
@@ -438,7 +442,6 @@ if [ -f "$INST_INFO" ]; then
     done < "$INST_INFO"
 fi
 
-# ── 验证 ─────────────────────────────────────────────────────
 echo "" && echo "🔍 验证配置..."
 ALL_OK=true
 if [ -f "$INST_INFO" ]; then
@@ -453,7 +456,6 @@ if [ -f "$INST_INFO" ]; then
     done < "$INST_INFO"
 fi
 
-# ── 启动 ─────────────────────────────────────────────────────
 echo "" && echo "🚀 启动服务..."
 systemctl daemon-reload
 if [ -f "$INST_INFO" ]; then
@@ -470,7 +472,6 @@ if [ -f "$INST_INFO" ]; then
     done < "$INST_INFO"
 fi
 
-# ── 出口验证 ─────────────────────────────────────────────────
 echo "" && echo "🔍 出口验证..."
 SV4=$(curl -4 -sf --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || echo "N/A")
 SV6=$(curl -6 -sf --connect-timeout 5 --max-time 10 https://api6.ipify.org 2>/dev/null || echo "N/A")
@@ -481,27 +482,34 @@ echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║                   🎉 四出口配置完成                           ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
-printf "║  实例1: 主IPv4     | %-41s║\n" "$MAIN_PUBLIC_IPV4 (原始)"
-[ "$HAS_RV4" = true ] && printf "║  实例2: 保留IPv4   | %-41s║\n" "$RESERVED_IPV4_LINK (端口+1)"
-printf "║  实例3: 主IPv6     | %-41s║\n" "$MAIN_IPV6 (端口+2)"
-[ "$HAS_RV6" = true ] && printf "║  实例4: 保留IPv6   | %-41s║\n" "$RESERVED_IPV6 (端口+3)"
+printf "║  实例1: 主IPv4     | 出口 %-36s║\n" "$MAIN_PUBLIC_IPV4"
+[ "$HAS_RV4" = true ] && \
+printf "║  实例2: 保留IPv4   | 出口 %-36s║\n" "$RESERVED_IPV4_LINK"
+printf "║  实例3: 主IPv6     | 出口 %-36s║\n" "$MAIN_IPV6"
+[ "$HAS_RV6" = true ] && \
+printf "║  实例4: 保留IPv6   | 出口 %-36s║\n" "$RESERVED_IPV6"
 echo "╠═══════════════════════════════════════════════════════════════╣"
-echo "║  📁 /etc/s-box/sb.json                       (实例1)         ║"
-[ "$HAS_RV4" = true ] && echo "║  📁 /etc/s-box/sb-reserved-v4.json         (实例2)         ║"
-echo "║  📁 /etc/s-box/sb-ipv6.json                  (实例3)         ║"
-[ "$HAS_RV6" = true ] && echo "║  📁 /etc/s-box/sb-reserved-v6.json         (实例4)         ║"
-echo "║  🔗 /etc/s-box/all-links.txt                                 ║"
+echo "║  📁 配置文件:                                                 ║"
+echo "║    /etc/s-box/sb.json                          (实例1)       ║"
+[ "$HAS_RV4" = true ] && \
+echo "║    /etc/s-box/sb-reserved-v4.json              (实例2)       ║"
+echo "║    /etc/s-box/sb-ipv6.json                     (实例3)       ║"
+[ "$HAS_RV6" = true ] && \
+echo "║    /etc/s-box/sb-reserved-v6.json              (实例4)       ║"
+echo "║  🔗 /etc/s-box/all-links.txt                   (全部链接)   ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  ⚠️  IPv6严格模式(实例3/4):                                   ║"
-echo "║     • DNS: strategy:ipv6_only + default_domain_resolver      ║"
-echo "║     • 路由: ip_version:4 + 0.0.0.0/0 双重 reject action     ║"
-echo "║     • 出站: inet6_bind_address + domain_resolver → direct    ║"
-echo "║     • 纯IPv4网站不可达（预期行为）                             ║"
+echo "║    • DNS: strategy:ipv6_only (仅AAAA记录)                    ║"
+echo "║    • 路由: ip_version:4 + 0.0.0.0/0 双重reject               ║"
+echo "║    • 出站: inet6_bind_address 绑定指定IPv6                    ║"
+echo "║    • 纯IPv4网站不可达（预期行为）                              ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  🛠️  管理:                                                     ║"
-echo "║  systemctl status sing-box                          (主IPv4) ║"
-[ "$HAS_RV4" = true ] && echo "║  systemctl status sing-box-reserved-v4              (保留IPv4)║"
-echo "║  systemctl status sing-box-ipv6                     (主IPv6) ║"
-[ "$HAS_RV6" = true ] && echo "║  systemctl status sing-box-reserved-v6              (保留IPv6)║"
-echo "║  cat /etc/s-box/all-links.txt                        (链接) ║"
+echo "║  systemctl status sing-box                         (主IPv4)  ║"
+[ "$HAS_RV4" = true ] && \
+echo "║  systemctl status sing-box-reserved-v4             (保留IPv4)║"
+echo "║  systemctl status sing-box-ipv6                    (主IPv6)  ║"
+[ "$HAS_RV6" = true ] && \
+echo "║  systemctl status sing-box-reserved-v6             (保留IPv6)║"
+echo "║  cat /etc/s-box/all-links.txt                      (链接)   ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
