@@ -28,14 +28,13 @@ python3 -c "from cryptography.hazmat.primitives.asymmetric.x25519 import X25519P
     pip3 install cryptography -q 2>/dev/null || apt-get install -y -qq python3-cryptography 2>/dev/null || true
 }
 
-# ── sing-box 路径和版本 ──────────────────────────────────────
+# ── sing-box ─────────────────────────────────────────────────
 if [ -x /etc/s-box/sing-box ]; then
     SINGBOX_BIN="/etc/s-box/sing-box"
 elif command -v sing-box &>/dev/null; then
     SINGBOX_BIN=$(command -v sing-box)
 else
-    echo "❌ 找不到 sing-box，请先安装"
-    exit 1
+    echo "❌ 找不到 sing-box"; exit 1
 fi
 
 SB_VERSION=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' || echo "0.0.0")
@@ -43,9 +42,8 @@ SB_MM=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' | cut -d'.
 echo "📌 sing-box: $SINGBOX_BIN (v$SB_VERSION)"
 
 # ── DO 元数据 ────────────────────────────────────────────────
-echo ""
-echo "🔍 查询 DigitalOcean 元数据..."
-METADATA_JSON=$(curl -sf http://169.254.169.254/metadata/v1.json 2>/dev/null) || { echo "❌ 无法访问元数据 API"; exit 1; }
+echo "" && echo "🔍 查询 DigitalOcean 元数据..."
+METADATA_JSON=$(curl -sf http://169.254.169.254/metadata/v1.json 2>/dev/null) || { echo "❌ 元数据不可用"; exit 1; }
 echo "$METADATA_JSON" > /tmp/do_metadata_debug.json
 
 MAIN_PUBLIC_IPV4=$(curl -sf http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null || echo "")
@@ -80,28 +78,19 @@ printf "│ 主 IPv6         : %-38s│\n" "${MAIN_IPV6:-❌}"
 printf "│ IPv6 网关       : %-38s│\n" "${MAIN_IPV6_GATEWAY:-⚠️}"
 printf "│ 保留 IPv6       : %-38s│\n" "${RESERVED_IPV6:-⚠️}"
 printf "│ 保留IPv6激活    : %-38s│\n" "${RESERVED_IPV6_ACTIVE:-⚠️}"
-printf "│ 标签/版本       : %-38s│\n" "$HOSTNAME_LABEL / sing-box v$SB_VERSION"
+printf "│ 标签/版本       : %-38s│\n" "$HOSTNAME_LABEL / v$SB_VERSION"
 echo "└──────────────────────────────────────────────────────────┘"
 
 # ── 验证 ─────────────────────────────────────────────────────
 ERRORS=(); WARNINGS=()
 [ -z "$MAIN_PUBLIC_IPV4" ] && ERRORS+=("主IPv4不可用")
 [ -z "$MAIN_IPV6" ] && ERRORS+=("主IPv6不可用")
-
-if [ -z "$MAIN_ANCHOR_IPV4" ]; then
-    WARNINGS+=("无Anchor IPv4，跳过实例2"); HAS_RV4=false
-else HAS_RV4=true; fi
-
+if [ -z "$MAIN_ANCHOR_IPV4" ]; then WARNINGS+=("无Anchor IPv4，跳过实例2"); HAS_RV4=false; else HAS_RV4=true; fi
 [ -z "$RESERVED_IPV4" ] && RESERVED_IPV4_LINK="$MAIN_PUBLIC_IPV4" || RESERVED_IPV4_LINK="$RESERVED_IPV4"
-
-if [ -z "$RESERVED_IPV6" ] || [ "$RESERVED_IPV6_ACTIVE" != "true" ]; then
-    WARNINGS+=("保留IPv6不可用/未激活，跳过实例4"); HAS_RV6=false
-else HAS_RV6=true; fi
+if [ -z "$RESERVED_IPV6" ] || [ "$RESERVED_IPV6_ACTIVE" != "true" ]; then WARNINGS+=("保留IPv6不可用，跳过实例4"); HAS_RV6=false; else HAS_RV6=true; fi
 
 [ ${#WARNINGS[@]} -gt 0 ] && echo "" && for w in "${WARNINGS[@]}"; do echo "⚠️  $w"; done
-if [ ${#ERRORS[@]} -gt 0 ]; then
-    echo "" && for e in "${ERRORS[@]}"; do echo "❌ $e"; done; exit 1
-fi
+if [ ${#ERRORS[@]} -gt 0 ]; then echo "" && for e in "${ERRORS[@]}"; do echo "❌ $e"; done; exit 1; fi
 
 SOURCE_FILE="/etc/s-box/sb.json"
 [ ! -f "$SOURCE_FILE" ] && echo "❌ 找不到 $SOURCE_FILE" && exit 1
@@ -113,8 +102,7 @@ for ns in all default eth0 lo; do sysctl -w net.ipv6.conf.$ns.disable_ipv6=0 >/d
 echo "   ├─ ✅ IPv6 已启用"
 
 if [ "$HAS_RV6" = true ]; then
-    ip -6 addr replace "${RESERVED_IPV6}/128" dev lo scope global 2>/dev/null || \
-        ip -6 addr add "${RESERVED_IPV6}/128" dev lo scope global 2>/dev/null || true
+    ip -6 addr replace "${RESERVED_IPV6}/128" dev lo scope global 2>/dev/null || ip -6 addr add "${RESERVED_IPV6}/128" dev lo scope global 2>/dev/null || true
     ip -6 addr show dev lo | grep -q "$RESERVED_IPV6" && echo "   ├─ ✅ 保留IPv6 绑定 lo" || { echo "   ├─ ❌ 绑定失败"; HAS_RV6=false; }
 fi
 
@@ -146,7 +134,7 @@ EOF
 systemctl daemon-reload && systemctl enable do-ipv6-routes.service >/dev/null 2>&1
 echo "   └─ ✅ 持久化已注册"
 
-# ── Python 生成配置和链接 ────────────────────────────────────
+# ── Python 生成 ──────────────────────────────────────────────
 echo "" && echo "⚙️  生成配置..."
 
 python3 << PYEOF
@@ -172,9 +160,8 @@ try:
 except:
     sb_major, sb_minor = 99, 99
 
-# 版本特性检测
-use_new_dns   = (sb_major > 1) or (sb_major == 1 and sb_minor >= 12)  # 1.12+ 新 DNS server 格式
-use_new_route = (sb_major > 1) or (sb_major == 1 and sb_minor >= 11)  # 1.11+ action 替代 block outbound
+use_new_dns   = (sb_major > 1) or (sb_major == 1 and sb_minor >= 12)
+use_new_route = (sb_major > 1) or (sb_major == 1 and sb_minor >= 11)
 
 print(f"   v{sb_mm} | 新DNS: {use_new_dns} | 新路由: {use_new_route}")
 
@@ -213,18 +200,15 @@ def force_ipv4_listen(cfg):
 
 def build_ipv6_dns():
     """
-    严格 IPv6-only DNS 配置
+    严格 IPv6-only DNS
     
-    关键: strategy 只在全局级别设置，不在 server 对象内部
-    1.12+ 新格式: type/server/server_port (不含 strategy)
-    1.11- 旧格式: address (不含 strategy，strategy 在全局)
+    1.12+: type/server/server_port 格式, strategy 仅在全局
+    1.11-: address 格式, strategy 可在 server 和全局
     
-    使用 IPv6 地址直连 DNS，无需二次解析
+    DNS 服务器使用 IPv6 地址直连，无需域名解析
+    全局 strategy: ipv6_only 确保只请求 AAAA 记录
     """
     if use_new_dns:
-        # sing-box 1.12+ 新格式
-        # server 对象只接受: tag, type, server, server_port
-        # strategy 只能放在全局 dns 对象中
         return {
             "servers": [
                 {
@@ -246,7 +230,6 @@ def build_ipv6_dns():
             "independent_cache": True
         }
     else:
-        # sing-box 1.10/1.11 旧格式
         return {
             "servers": [
                 {
@@ -271,10 +254,23 @@ def build_ipv6_dns():
         }
 
 def build_ipv6_route():
-    """严格 IPv6 路由"""
+    """
+    严格 IPv6 路由
+    
+    1.12+ 要求 route 中必须有 default_domain_resolver
+    指向 DNS server 的 tag，解决出站域名解析
+    
+    五层防护:
+    1. sniff - 协议嗅探提取域名
+    2. hijack-dns - DNS 劫持到本地 ipv6_only 解析器
+    3. reject ip_version:4 - 拦截所有 IPv4 目标
+    4. reject 0.0.0.0/0 - 双重保险拦截 IPv4
+    5. route -> direct (已绑定 IPv6)
+    
+    final: reject - 零信任兜底
+    """
     if use_new_route:
-        # 1.11+ action 风格
-        return {
+        route = {
             "rules": [
                 {"action": "sniff", "timeout": "1s"},
                 {"protocol": "dns", "action": "hijack-dns"},
@@ -285,8 +281,13 @@ def build_ipv6_route():
             "final": "reject",
             "auto_detect_interface": False
         }
+        # 1.12+ 必须有 default_domain_resolver
+        if use_new_dns:
+            route["default_domain_resolver"] = {
+                "server": "ipv6-dns-cf"
+            }
+        return route
     else:
-        # 1.10.x outbound 风格
         return {
             "rules": [
                 {"protocol": ["quic", "stun"], "outbound": "block-out"},
@@ -296,7 +297,15 @@ def build_ipv6_route():
         }
 
 def build_ipv6_outbounds(bind_v6):
-    """严格 IPv6 出站"""
+    """
+    严格 IPv6 出站
+    
+    - inet6_bind_address: 强制 bind() 到指定 IPv6
+    - bind_interface: eth0 锁定物理接口
+    - bind_address_no_port: 防高并发端口耗尽
+    - tcp_multi_path: false 禁 MPTCP 防 IPv4 子流
+    - domain_resolver: 1.12+ 出站域名解析器
+    """
     direct_ob = {
         "type": "direct",
         "tag": "direct",
@@ -307,12 +316,10 @@ def build_ipv6_outbounds(bind_v6):
         "tcp_fast_open": False,
         "udp_fragment": True
     }
-    # 1.12+ 出站用 domain_resolver 替代 domain_strategy
     if use_new_dns:
         direct_ob["domain_resolver"] = "ipv6-dns-cf"
     
     obs = [direct_ob]
-    # 1.10.x 需要 block outbound
     if not use_new_route:
         obs.append({"type": "block", "tag": "block-out"})
     return obs
@@ -378,7 +385,6 @@ else:
     print("\n⏭️  实例4: 跳过")
 
 # ═══════════════════════════════════════════════════════════
-# 订阅链接
 common_sni = get_common_sni(original_config)
 
 def gen_links(cfg, ip, suffix):
@@ -414,8 +420,8 @@ sections.append(("实例1-主IPv4", f"出口: {main_public_ipv4}", gen_links(ori
 for iid, ifile, icfg, iip, ilabel in generated:
     ll = gen_links(icfg, iip, ilabel)
     if "ipv6" in iid:
-        v6addr = reserved_ipv6 if "reserved" in iid else main_ipv6
-        info = f"入口: {main_public_ipv4} → 出口: {v6addr}"
+        v6a = reserved_ipv6 if "reserved" in iid else main_ipv6
+        info = f"入口: {main_public_ipv4} → 出口: {v6a}"
     else:
         info = f"出口: {iip}"
     sections.append((f"实例-{ilabel}", info, ll))
@@ -441,16 +447,11 @@ for i, (sn, si, sl) in enumerate(sections, 1):
 with open(f"{CONFIG_DIR}/.generated_instances", 'w') as f:
     for iid, ifile, _, _, ilabel in generated:
         f.write(f"{iid}|{ifile}|{ilabel}\n")
-
-# 调试: 打印生成的 IPv6 DNS 配置
-print("\n📋 IPv6 DNS 配置预览:")
-dns_cfg = build_ipv6_dns()
-print(json.dumps(dns_cfg, indent=2))
 PYEOF
 
 [ $? -ne 0 ] && echo "❌ 生成失败" && exit 1
 
-# ── systemd 服务 ─────────────────────────────────────────────
+# ── systemd ──────────────────────────────────────────────────
 echo "" && echo "⚙️  systemd 服务..."
 SVC_SRC="/etc/systemd/system/sing-box.service"
 [ ! -f "$SVC_SRC" ] && echo "❌ 找不到 $SVC_SRC" && exit 1
@@ -504,7 +505,6 @@ SV6=$(curl -6 -sf --connect-timeout 5 --max-time 10 https://api6.ipify.org 2>/de
 printf "   IPv4: %-40s (期望: %s)\n" "$SV4" "$MAIN_PUBLIC_IPV4"
 printf "   IPv6: %-40s (期望: %s)\n" "$SV6" "$MAIN_IPV6"
 
-# ── 报告 ─────────────────────────────────────────────────────
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║                   🎉 四出口配置完成                           ║"
@@ -521,9 +521,9 @@ echo "║  📁 /etc/s-box/sb-ipv6.json                  (实例3)         ║"
 echo "║  🔗 /etc/s-box/all-links.txt                                 ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  ⚠️  IPv6严格模式(实例3/4):                                   ║"
-echo "║     • DNS: 全局 strategy:ipv6_only (仅AAAA)                  ║"
+echo "║     • DNS: 全局 strategy:ipv6_only + default_domain_resolver ║"
 echo "║     • 路由: ip_version:4 + 0.0.0.0/0 双重reject              ║"
-echo "║     • 出站: inet6_bind_address 绑定指定IPv6                   ║"
+echo "║     • 出站: inet6_bind_address + domain_resolver             ║"
 echo "║     • 纯IPv4网站不可达（预期行为）                             ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  🛠️  管理:                                                     ║"
