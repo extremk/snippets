@@ -4,10 +4,10 @@
 # 兼容 sing-box 1.10.x / 1.11.x / 1.12.x / 1.13.x
 #
 # 出口架构:
-#   实例1: 主IPv4出口      (主端口)     - sb.json (不修改)
-#   实例2: 保留IPv4出口    (主端口+1)   - sb-reserved-v4.json
-#   实例3: 主IPv6出口      (主端口+2)   - sb-ipv6.json
-#   实例4: 保留IPv6出口    (主端口+3)   - sb-reserved-v6.json
+#   实例1: 主IPv4      (主端口)   - sb.json (不修改)
+#   实例2: 保留IPv4    (端口+1)   - sb-reserved-v4.json
+#   实例3: 主IPv6      (端口+2)   - sb-ipv6.json
+#   实例4: 保留IPv6    (端口+3)   - sb-reserved-v6.json
 # ====================================================
 
 set -euo pipefail
@@ -41,8 +41,20 @@ SB_VERSION=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' || ec
 SB_MM=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' | cut -d'.' -f1,2 || echo "0.0")
 echo "📌 sing-box: $SINGBOX_BIN (v$SB_VERSION)"
 
+# ── 停止旧的副实例服务（防止端口冲突）─────────────────────────
+echo ""
+echo "🔄 停止旧的副实例服务..."
+for svc in sing-box-reserved-v4 sing-box-ipv6 sing-box-reserved-v6; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc" 2>/dev/null
+        echo "   ├─ 已停止 $svc"
+    fi
+done
+sleep 1
+
 # ── DO 元数据 ────────────────────────────────────────────────
-echo "" && echo "🔍 查询 DigitalOcean 元数据..."
+echo ""
+echo "🔍 查询 DigitalOcean 元数据..."
 METADATA_JSON=$(curl -sf http://169.254.169.254/metadata/v1.json 2>/dev/null) || { echo "❌ 元数据不可用"; exit 1; }
 echo "$METADATA_JSON" > /tmp/do_metadata_debug.json
 
@@ -201,28 +213,14 @@ def force_ipv4_listen(cfg):
 def build_ipv6_dns():
     """
     严格 IPv6-only DNS
-    
-    1.12+: type/server/server_port 格式, strategy 仅在全局
-    1.11-: address 格式, strategy 可在 server 和全局
-    
-    DNS 服务器使用 IPv6 地址直连，无需域名解析
-    全局 strategy: ipv6_only 确保只请求 AAAA 记录
+    全局 strategy: ipv6_only → 所有解析仅返回 AAAA 记录
+    DNS 服务器直接用 IPv6 地址，不需要域名解析
     """
     if use_new_dns:
         return {
             "servers": [
-                {
-                    "tag": "ipv6-dns-cf",
-                    "type": "tls",
-                    "server": "2606:4700:4700::1111",
-                    "server_port": 853
-                },
-                {
-                    "tag": "ipv6-dns-google",
-                    "type": "tls",
-                    "server": "2001:4860:4860::8888",
-                    "server_port": 853
-                }
+                {"tag": "ipv6-dns-cf", "type": "tls", "server": "2606:4700:4700::1111", "server_port": 853},
+                {"tag": "ipv6-dns-google", "type": "tls", "server": "2001:4860:4860::8888", "server_port": 853}
             ],
             "final": "ipv6-dns-cf",
             "strategy": "ipv6_only",
@@ -232,20 +230,8 @@ def build_ipv6_dns():
     else:
         return {
             "servers": [
-                {
-                    "tag": "ipv6-dns-cf",
-                    "address": "tls://[2606:4700:4700::1111]",
-                    "address_strategy": "ipv6_only",
-                    "strategy": "ipv6_only",
-                    "detour": "direct"
-                },
-                {
-                    "tag": "ipv6-dns-google",
-                    "address": "tls://[2001:4860:4860::8888]",
-                    "address_strategy": "ipv6_only",
-                    "strategy": "ipv6_only",
-                    "detour": "direct"
-                }
+                {"tag": "ipv6-dns-cf", "address": "tls://[2606:4700:4700::1111]", "address_strategy": "ipv6_only", "strategy": "ipv6_only", "detour": "direct"},
+                {"tag": "ipv6-dns-google", "address": "tls://[2001:4860:4860::8888]", "address_strategy": "ipv6_only", "strategy": "ipv6_only", "detour": "direct"}
             ],
             "final": "ipv6-dns-cf",
             "strategy": "ipv6_only",
@@ -255,19 +241,20 @@ def build_ipv6_dns():
 
 def build_ipv6_route():
     """
-    严格 IPv6 路由
+    严格 IPv6 路由 — IPv4 全拦截
     
-    1.12+ 要求 route 中必须有 default_domain_resolver
-    指向 DNS server 的 tag，解决出站域名解析
+    关键: final 必须指向一个已存在的 outbound tag
+    不能用 "reject" 作为 final（那不是 outbound tag）
     
-    五层防护:
-    1. sniff - 协议嗅探提取域名
-    2. hijack-dns - DNS 劫持到本地 ipv6_only 解析器
-    3. reject ip_version:4 - 拦截所有 IPv4 目标
-    4. reject 0.0.0.0/0 - 双重保险拦截 IPv4
-    5. route -> direct (已绑定 IPv6)
+    设计:
+    - 规则1: sniff 提取域名
+    - 规则2: hijack-dns 到本地 ipv6_only 解析器
+    - 规则3: reject 所有 ip_version:4 (TCP RST / ICMP unreachable)
+    - 规则4: reject 0.0.0.0/0 (双重保险)
+    - 无需最后 route->direct 规则，由 final 兜底
     
-    final: reject - 零信任兜底
+    final: "direct" — 所有通过上面 reject 规则的流量（即 IPv6）
+    走 direct 出站，direct 已绑定指定 IPv6 地址
     """
     if use_new_route:
         route = {
@@ -275,17 +262,13 @@ def build_ipv6_route():
                 {"action": "sniff", "timeout": "1s"},
                 {"protocol": "dns", "action": "hijack-dns"},
                 {"ip_version": 4, "action": "reject", "method": "default"},
-                {"ip_cidr": ["0.0.0.0/0"], "action": "reject", "method": "default"},
-                {"action": "route", "outbound": "direct"}
+                {"ip_cidr": ["0.0.0.0/0"], "action": "reject", "method": "default"}
             ],
-            "final": "reject",
+            "final": "direct",
             "auto_detect_interface": False
         }
-        # 1.12+ 必须有 default_domain_resolver
         if use_new_dns:
-            route["default_domain_resolver"] = {
-                "server": "ipv6-dns-cf"
-            }
+            route["default_domain_resolver"] = {"server": "ipv6-dns-cf"}
         return route
     else:
         return {
@@ -300,11 +283,9 @@ def build_ipv6_outbounds(bind_v6):
     """
     严格 IPv6 出站
     
-    - inet6_bind_address: 强制 bind() 到指定 IPv6
-    - bind_interface: eth0 锁定物理接口
-    - bind_address_no_port: 防高并发端口耗尽
-    - tcp_multi_path: false 禁 MPTCP 防 IPv4 子流
-    - domain_resolver: 1.12+ 出站域名解析器
+    只有一个 direct 出站，强制绑定到指定 IPv6 地址
+    route.final 指向这个 direct
+    IPv4 流量在路由规则中被 reject，永远到不了这里
     """
     direct_ob = {
         "type": "direct",
@@ -335,7 +316,7 @@ def apply_ipv6(cfg, bind_v6):
 # ═══════════════════════════════════════════════════════════
 generated = []
 
-# 实例2: 保留 IPv4
+# 实例2
 if has_rv4 and anchor_ipv4:
     print(f"\n📋 实例2: 保留IPv4 (端口+1, Anchor: {anchor_ipv4})")
     c = copy.deepcopy(original_config)
@@ -350,8 +331,7 @@ if has_rv4 and anchor_ipv4:
     if not bound:
         c.setdefault('outbounds', []).insert(0, {
             "type": "direct", "tag": "direct",
-            "inet4_bind_address": anchor_ipv4,
-            "udp_fragment": True, "bind_address_no_port": True
+            "inet4_bind_address": anchor_ipv4, "udp_fragment": True, "bind_address_no_port": True
         })
     print(f"      出站绑定: {anchor_ipv4}")
     fp = f"{CONFIG_DIR}/sb-reserved-v4.json"
@@ -361,7 +341,7 @@ if has_rv4 and anchor_ipv4:
 else:
     print("\n⏭️  实例2: 跳过")
 
-# 实例3: 主 IPv6
+# 实例3
 print(f"\n📋 实例3: 主IPv6 (端口+2, 绑定: {main_ipv6})")
 c = copy.deepcopy(original_config)
 shift_ports(c, 2)
@@ -371,7 +351,7 @@ with open(fp, 'w') as f: json.dump(c, f, indent=4, ensure_ascii=False)
 print(f"      ✅ {fp}")
 generated.append(("ipv6", fp, c, main_public_ipv4, "主IPv6"))
 
-# 实例4: 保留 IPv6
+# 实例4
 if has_rv6 and reserved_ipv6:
     print(f"\n📋 实例4: 保留IPv6 (端口+3, 绑定: {reserved_ipv6})")
     c = copy.deepcopy(original_config)
@@ -394,7 +374,6 @@ def gen_links(cfg, ip, suffix):
         tag = ib.get('tag', '').replace('-sb', '')
         lbl = f"{tag}-{hostname}-{suffix}"
         tls = ib.get('tls', {}); sni = tls.get('server_name', common_sni) or common_sni
-
         if t == 'vless':
             u = ib['users'][0]['uuid']; fl = ib['users'][0].get('flow', 'xtls-rprx-vision')
             r = tls.get('reality', {}); pk = r.get('private_key', ''); sid = r.get('short_id', [''])[0]
@@ -404,7 +383,7 @@ def gen_links(cfg, ip, suffix):
             u = ib['users'][0]['uuid']; tp = ib.get('transport', {}); path = tp.get('path', '')
             tls_on = tls.get('enabled', False)
             obj = {"v":"2","ps":f"vm-ws-{hostname}-{suffix}","add":ip,"port":str(p),"id":u,"aid":"0","scy":"auto","net":"ws","type":"none","host":sni,"path":path,"tls":"tls" if tls_on else "","sni":sni if tls_on else "","alpn":"","fp":"","insecure":"0"}
-            links.append(('VMess WS', f"vmess://{base64.b64encode(json.dumps(obj, separators=(",",": "), ensure_ascii=False).encode()).decode()}"))
+            links.append(('VMess WS', f"vmess://{base64.b64encode(json.dumps(obj, separators=(',',': '), ensure_ascii=False).encode()).decode()}"))
         elif t == 'hysteria2':
             links.append(('Hysteria2', f"hysteria2://{ib['users'][0]['password']}@{ip}:{p}?sni={sni}&alpn=h3&insecure=1&allowInsecure=1#{lbl}"))
         elif t == 'tuic':
@@ -416,7 +395,6 @@ def gen_links(cfg, ip, suffix):
 
 sections = []
 sections.append(("实例1-主IPv4", f"出口: {main_public_ipv4}", gen_links(original_config, main_public_ipv4, "主IPv4")))
-
 for iid, ifile, icfg, iip, ilabel in generated:
     ll = gen_links(icfg, iip, ilabel)
     if "ipv6" in iid:
@@ -433,7 +411,7 @@ for sn, si, sl in sections:
 
 lf = f"{CONFIG_DIR}/all-links.txt"
 with open(lf, 'w') as f:
-    f.write(f"# DO四出口 | {hostname} | 主IPv4:{main_public_ipv4} | 主IPv6:{main_ipv6}\n\n")
+    f.write(f"# DO四出口 | {hostname} | IPv4:{main_public_ipv4} | IPv6:{main_ipv6}\n\n")
     for sn, si, sl in sections:
         f.write(f"{'#'*60}\n# {sn} | {si}\n{'#'*60}\n\n")
         for n, l in sl: f.write(f"# {n}\n{l}\n\n")
@@ -521,9 +499,10 @@ echo "║  📁 /etc/s-box/sb-ipv6.json                  (实例3)         ║"
 echo "║  🔗 /etc/s-box/all-links.txt                                 ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  ⚠️  IPv6严格模式(实例3/4):                                   ║"
-echo "║     • DNS: 全局 strategy:ipv6_only + default_domain_resolver ║"
-echo "║     • 路由: ip_version:4 + 0.0.0.0/0 双重reject              ║"
-echo "║     • 出站: inet6_bind_address + domain_resolver             ║"
+echo "║     • DNS: strategy:ipv6_only + default_domain_resolver      ║"
+echo "║     • 路由: ip_version:4 + 0.0.0.0/0 双重 reject action     ║"
+echo "║     • 出站: inet6_bind_address 绑定 + domain_resolver        ║"
+echo "║     • final → direct (已绑IPv6), IPv4 在规则层被 reject      ║"
 echo "║     • 纯IPv4网站不可达（预期行为）                             ║"
 echo "╠═══════════════════════════════════════════════════════════════╣"
 echo "║  🛠️  管理:                                                     ║"
