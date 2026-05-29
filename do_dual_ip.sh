@@ -1,6 +1,7 @@
 #!/bin/bash
 # ====================================================
-# DigitalOcean 双开保留 IP 一键配置脚本 (适配 Ubuntu 24.04)
+# DigitalOcean 双开保留 IP 一键配置脚本 (适配 Ubuntu 20.04/22.04/24.04)
+# 兼容 Python 3.8+ (不使用 f-string，确保旧系统兼容)
 # 作用: 自动读取 DO Anchor IP，端口自动+1，绑定出站网卡，注册双开服务，生成订阅链接
 # ====================================================
 
@@ -63,7 +64,7 @@ try:
     with open(source_file, 'r', encoding='utf-8') as f:
         config = json.load(f)
 except Exception as e:
-    print(f'❌ 解析 JSON 失败: {e}')
+    print('❌ 解析 JSON 失败: %s' % e)
     sys.exit(1)
 
 # 端口 + 1
@@ -72,7 +73,7 @@ if 'inbounds' in config:
         if 'listen_port' in inbound and isinstance(inbound['listen_port'], int):
             old_port = inbound['listen_port']
             inbound['listen_port'] = old_port + 1
-            print(f"✅ 端口自动修改成功: {old_port} -> {inbound['listen_port']}")
+            print("✅ 端口自动修改成功: %d -> %d" % (old_port, inbound['listen_port']))
 
 # 绑定网卡与 UDP 优化
 if 'outbounds' in config:
@@ -81,7 +82,7 @@ if 'outbounds' in config:
         if outbound.get('tag') == 'direct' and outbound.get('type') == 'direct':
             outbound['inet4_bind_address'] = anchor_ip
             outbound['udp_fragment'] = True
-            print(f"✅ 出站网卡绑定成功: 锁定至 {anchor_ip}")
+            print("✅ 出站网卡绑定成功: 锁定至 %s" % anchor_ip)
             modified = True
             break
     if not modified:
@@ -116,7 +117,7 @@ try:
     with open(config_file, 'r', encoding='utf-8') as f:
         config = json.load(f)
 except Exception as e:
-    print(f'❌ 解析配置文件失败: {e}')
+    print('❌ 解析配置文件失败: %s' % e)
     sys.exit(1)
 
 # ── 从 X25519 私钥推导公钥（用于 VLESS Reality pbk 参数）──────────────
@@ -130,7 +131,7 @@ def derive_x25519_pubkey(private_key_b64url):
         pub_raw = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         return base64.urlsafe_b64encode(pub_raw).rstrip(b'=').decode()
     except Exception as e:
-        print(f"⚠️  公钥推导失败（{e}），pbk 将留空，请手动填写。")
+        print("⚠️  公钥推导失败（%s），pbk 将留空，请手动填写。" % e)
         return ""
 
 # ── 查找通用 SNI（取 vmess 的 server_name，用于其他协议兜底）─────────────
@@ -148,7 +149,7 @@ for inbound in config.get('inbounds', []):
     itype = inbound.get('type')
     port  = inbound.get('listen_port')
     tag   = inbound.get('tag', '').replace('-sb', '')
-    label = f"{tag}-{hostname}-备用IP"
+    label = "%s-%s-备用IP" % (tag, hostname)
     tls   = inbound.get('tls', {})
     sni   = tls.get('server_name', common_sni) or common_sni
 
@@ -161,11 +162,11 @@ for inbound in config.get('inbounds', []):
         short_id = reality.get('short_id', [''])[0]
         pbk      = derive_x25519_pubkey(priv_key)
         link = (
-            f"vless://{uuid}@{public_ip}:{port}"
-            f"?encryption=none&flow={flow}&security=reality"
-            f"&sni={sni}&fp=chrome&pbk={pbk}&sid={short_id}"
-            f"&type=tcp&headerType=none#{label}"
-        )
+            "vless://%s@%s:%s"
+            "?encryption=none&flow=%s&security=reality"
+            "&sni=%s&fp=chrome&pbk=%s&sid=%s"
+            "&type=tcp&headerType=none#%s"
+        ) % (uuid, public_ip, port, flow, sni, pbk, short_id, label)
         links.append(('VLESS Reality', link))
 
     # ── VMess WS ───────────────────────────────────────────────────────
@@ -176,7 +177,7 @@ for inbound in config.get('inbounds', []):
         tls_on    = tls.get('enabled', False)
         vmess_obj = {
             "v":        "2",
-            "ps":       f"vm-ws-{hostname}-备用IP",
+            "ps":       "vm-ws-%s-备用IP" % hostname,
             "add":      public_ip,
             "port":     str(port),
             "id":       uuid,
@@ -192,61 +193,60 @@ for inbound in config.get('inbounds', []):
             "fp":       "",
             "insecure": "0"
         }
-        encoded = base64.b64encode(
-            json.dumps(vmess_obj, separators=(',', ': '), ensure_ascii=False).encode()
-        ).decode()
-        links.append(('VMess WS', f"vmess://{encoded}"))
+        vmess_json = json.dumps(vmess_obj, separators=(',', ': '), ensure_ascii=False)
+        encoded = base64.b64encode(vmess_json.encode()).decode()
+        links.append(('VMess WS', "vmess://" + encoded))
 
     # ── Hysteria2 ──────────────────────────────────────────────────────
     elif itype == 'hysteria2':
         password = inbound['users'][0]['password']
         link = (
-            f"hysteria2://{password}@{public_ip}:{port}"
-            f"?sni={sni}&alpn=h3&insecure=1&allowInsecure=1#{label}"
-        )
+            "hysteria2://%s@%s:%s"
+            "?sni=%s&alpn=h3&insecure=1&allowInsecure=1#%s"
+        ) % (password, public_ip, port, sni, label)
         links.append(('Hysteria2', link))
 
     # ── TUIC v5 ────────────────────────────────────────────────────────
     elif itype == 'tuic':
         uuid     = inbound['users'][0]['uuid']
         password = inbound['users'][0]['password']
-        auth     = quote(f"{uuid}:{password}", safe='')
+        auth     = quote("%s:%s" % (uuid, password), safe='')
         link = (
-            f"tuic://{auth}@{public_ip}:{port}"
-            f"?sni={sni}&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#{label}"
-        )
+            "tuic://%s@%s:%s"
+            "?sni=%s&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#%s"
+        ) % (auth, public_ip, port, sni, label)
         links.append(('TUIC v5', link))
 
     # ── AnyTLS ─────────────────────────────────────────────────────────
     elif itype == 'anytls':
         password = inbound['users'][0]['password']
         link = (
-            f"anytls://{password}@{public_ip}:{port}"
-            f"?security=tls&sni={sni}&insecure=1&allowInsecure=1&type=tcp#{label}"
-        )
+            "anytls://%s@%s:%s"
+            "?security=tls&sni=%s&insecure=1&allowInsecure=1&type=tcp#%s"
+        ) % (password, public_ip, port, sni, label)
         links.append(('AnyTLS', link))
 
 # ── 输出 ───────────────────────────────────────────────────────────────
-print(f"\n{'='*60}")
-print(f"  📡 Reserved IP: {public_ip}  |  节点标签: {hostname}")
-print(f"{'='*60}")
+print("\n" + "=" * 60)
+print("  📡 Reserved IP: %s  |  节点标签: %s" % (public_ip, hostname))
+print("=" * 60)
 
 all_links_text = []
 for name, link in links:
-    print(f"\n📌 {name}:")
+    print("\n📌 %s:" % name)
     print(link)
-    all_links_text.append(f"# {name}\n{link}")
+    all_links_text.append("# %s\n%s" % (name, link))
 
-print(f"\n{'─'*60}")
+print("\n" + "-" * 60)
 
 # 保存到文件
 with open(links_file, 'w', encoding='utf-8') as f:
     f.write("# 保留 IP 节点订阅链接\n")
-    f.write(f"# Reserved IP: {public_ip}\n\n")
+    f.write("# Reserved IP: %s\n\n" % public_ip)
     f.write("\n\n".join(all_links_text))
     f.write("\n")
 
-print(f"💾 订阅链接已保存至: {links_file}")
+print("💾 订阅链接已保存至: %s" % links_file)
 PYEOF
 
 if [ $? -ne 0 ]; then
