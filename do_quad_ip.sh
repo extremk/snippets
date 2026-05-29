@@ -2,6 +2,7 @@
 # ====================================================
 # DigitalOcean 四出口一键配置脚本 (适配 sing-box-yg)
 # 兼容 sing-box 1.11.x / 1.12.x / 1.13.x / sb.sh 管理脚本
+# 兼容 Python 3.8+ (Ubuntu 20.04/22.04/24.04)
 #
 # 严格协议隔离:
 #   实例1: 主IPv4      (主端口)   IPv4-only (修改sb.json)
@@ -150,11 +151,11 @@ except:
 use_new_dns   = (sb_major > 1) or (sb_major == 1 and sb_minor >= 12)
 use_new_route = (sb_major > 1) or (sb_major == 1 and sb_minor >= 11)
 
-print(f"   v{sb_mm} | 新DNS: {use_new_dns} | 新路由: {use_new_route}")
+print("   v%s | 新DNS: %s | 新路由: %s" % (sb_mm, use_new_dns, use_new_route))
 
 with open(source_file, 'r') as f:
     original_config = json.load(f)
-print(f"   ✅ {len(original_config.get('inbounds', []))} 个入站")
+print("   ✅ %d 个入站" % len(original_config.get('inbounds', [])))
 
 # ═══════════════════════════════════════════════════════════
 def derive_x25519_pubkey(pk):
@@ -177,28 +178,10 @@ def shift_ports(cfg, offset):
     for ib in cfg.get('inbounds', []):
         if 'listen_port' in ib and isinstance(ib['listen_port'], int):
             old = ib['listen_port']; ib['listen_port'] = old + offset
-            print(f"      端口: {old} -> {old + offset}")
+            print("      端口: %d -> %d" % (old, old + offset))
 
 # ═══════════════════════════════════════════════════════════
 # 实例1: 在原始 sb.json 上注入严格 IPv4 约束
-#
-# 甬哥 sb.sh 的 jq 查询路径（sb11.json 格式 / 1.11+）：
-#   .outbounds[0]                → direct
-#   .outbounds[1]                → socks-out
-#   .route.rules[0]              → sniff action
-#   .route.rules[1]              → resolve prefer_ipv4
-#   .route.rules[2]              → resolve prefer_ipv6
-#   .route.rules[3]              → socks-out 分流
-#   .route.rules[4]              → warp-out 分流
-#   .route.rules[5]              → direct final
-#
-# 策略：
-#   1. DNS: 注入全局 strategy: ipv4_only（新格式需替换整个dns块）
-#   2. 路由: 在最后一条 direct 规则之前插入 IPv6 reject
-#      这样 rules[0]-[4] 的索引保持不变，甬哥的 sed/jq 正常工作
-#   3. 出站: 保留原始 outbounds 结构不变
-#   4. 移除 endpoints (warp) 防 IPv6 泄漏
-#   5. 新格式需要 default_domain_resolver
 # ═══════════════════════════════════════════════════════════
 
 def inject_ipv4_strict(cfg):
@@ -206,8 +189,6 @@ def inject_ipv4_strict(cfg):
 
     # --- DNS ---
     if use_new_dns:
-        # 1.12+: 必须用新格式，完全替换 dns
-        # 但甬哥脚本不直接读 dns 块，所以安全
         cfg['dns'] = {
             "servers": [
                 {"tag": "ipv4-dns-cf", "type": "tls", "server": "1.1.1.1", "server_port": 853},
@@ -219,7 +200,6 @@ def inject_ipv4_strict(cfg):
             "independent_cache": True
         }
     else:
-        # 1.10/1.11: 在现有 dns 上注入
         if 'dns' not in cfg: cfg['dns'] = {}
         cfg['dns']['strategy'] = 'ipv4_only'
 
@@ -233,7 +213,6 @@ def inject_ipv4_strict(cfg):
     )]
 
     if use_new_route:
-        # 在最后一条规则之前插入（最后一条通常是 outbound: direct）
         reject_v6 = {"ip_version": 6, "action": "reject", "method": "default"}
         reject_v6_cidr = {"ip_cidr": ["::/0"], "action": "reject", "method": "default"}
 
@@ -343,54 +322,54 @@ def build_clean_ipv6(cfg, bind_v6):
 generated = []
 
 # 实例1
-print(f"\n📋 实例1: 主IPv4 (注入IPv4约束，保留原始结构)")
+print("\n📋 实例1: 主IPv4 (注入IPv4约束，保留原始结构)")
 cfg1 = copy.deepcopy(original_config)
 inject_ipv4_strict(cfg1)
-fp1 = f"{CONFIG_DIR}/sb.json"
+fp1 = CONFIG_DIR + "/sb.json"
 with open(fp1, 'w') as f: json.dump(cfg1, f, indent=4, ensure_ascii=False)
-print(f"      ✅ {fp1}")
+print("      ✅ " + fp1)
 generated.append(("main-v4", fp1, cfg1, main_public_ipv4, "主IPv4", "ipv4", main_public_ipv4))
 
 # 同步 sb10/sb11
-for sf in [f"{CONFIG_DIR}/sb10.json", f"{CONFIG_DIR}/sb11.json"]:
+for sf in [CONFIG_DIR + "/sb10.json", CONFIG_DIR + "/sb11.json"]:
     if os.path.exists(sf):
         try:
             with open(sf, 'r') as f: scfg = json.load(f)
             inject_ipv4_strict(scfg)
             with open(sf, 'w') as f: json.dump(scfg, f, indent=4, ensure_ascii=False)
-            print(f"      ✅ 同步 {os.path.basename(sf)}")
+            print("      ✅ 同步 " + os.path.basename(sf))
         except Exception as e:
-            print(f"      ⚠️  同步 {os.path.basename(sf)} 失败: {e}")
+            print("      ⚠️  同步 %s 失败: %s" % (os.path.basename(sf), e))
 
 # 实例2
 if has_rv4 and anchor_ipv4:
-    print(f"\n📋 实例2: 保留IPv4 (端口+1, Anchor: {anchor_ipv4})")
+    print("\n📋 实例2: 保留IPv4 (端口+1, Anchor: %s)" % anchor_ipv4)
     cfg2 = copy.deepcopy(original_config); shift_ports(cfg2, 1)
     build_clean_ipv4(cfg2, anchor_ipv4)
-    fp2 = f"{CONFIG_DIR}/sb-reserved-v4.json"
+    fp2 = CONFIG_DIR + "/sb-reserved-v4.json"
     with open(fp2, 'w') as f: json.dump(cfg2, f, indent=4, ensure_ascii=False)
-    print(f"      ✅ {fp2}")
+    print("      ✅ " + fp2)
     generated.append(("reserved-v4", fp2, cfg2, reserved_ipv4, "保留IPv4", "ipv4", reserved_ipv4))
 else:
     print("\n⏭️  实例2: 跳过")
 
 # 实例3
-print(f"\n📋 实例3: 主IPv6 (端口+2, 绑定: {main_ipv6})")
+print("\n📋 实例3: 主IPv6 (端口+2, 绑定: %s)" % main_ipv6)
 cfg3 = copy.deepcopy(original_config); shift_ports(cfg3, 2)
 build_clean_ipv6(cfg3, main_ipv6)
-fp3 = f"{CONFIG_DIR}/sb-ipv6.json"
+fp3 = CONFIG_DIR + "/sb-ipv6.json"
 with open(fp3, 'w') as f: json.dump(cfg3, f, indent=4, ensure_ascii=False)
-print(f"      ✅ {fp3}")
+print("      ✅ " + fp3)
 generated.append(("ipv6", fp3, cfg3, main_public_ipv4, "主IPv6", "ipv6", main_ipv6))
 
 # 实例4
 if has_rv6 and reserved_ipv6:
-    print(f"\n📋 实例4: 保留IPv6 (端口+3, 绑定: {reserved_ipv6})")
+    print("\n📋 实例4: 保留IPv6 (端口+3, 绑定: %s)" % reserved_ipv6)
     cfg4 = copy.deepcopy(original_config); shift_ports(cfg4, 3)
     build_clean_ipv6(cfg4, reserved_ipv6)
-    fp4 = f"{CONFIG_DIR}/sb-reserved-v6.json"
+    fp4 = CONFIG_DIR + "/sb-reserved-v6.json"
     with open(fp4, 'w') as f: json.dump(cfg4, f, indent=4, ensure_ascii=False)
-    print(f"      ✅ {fp4}")
+    print("      ✅ " + fp4)
     generated.append(("reserved-v6", fp4, cfg4, main_public_ipv4, "保留IPv6", "ipv6", reserved_ipv6))
 else:
     print("\n⏭️  实例4: 跳过")
@@ -402,57 +381,67 @@ def gen_links(cfg, ip, suffix):
     links = []
     for ib in cfg.get('inbounds', []):
         t = ib.get('type'); p = ib.get('listen_port')
-        tag = ib.get('tag', '').replace('-sb', ''); lbl = f"{tag}-{hostname}-{suffix}"
+        tag = ib.get('tag', '').replace('-sb', ''); lbl = "%s-%s-%s" % (tag, hostname, suffix)
         tls = ib.get('tls', {}); sni = tls.get('server_name', common_sni) or common_sni
         if t == 'vless':
             u = ib['users'][0]['uuid']; fl = ib['users'][0].get('flow', 'xtls-rprx-vision')
             r = tls.get('reality', {}); pk = r.get('private_key', ''); sid = r.get('short_id', [''])[0]
             pbk = derive_x25519_pubkey(pk) if pk else ''
-            links.append(('VLESS Reality', f"vless://{u}@{ip}:{p}?encryption=none&flow={fl}&security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&type=tcp&headerType=none#{lbl}"))
+            link = "vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s" % (u, ip, p, fl, sni, pbk, sid, lbl)
+            links.append(('VLESS Reality', link))
         elif t == 'vmess':
             u = ib['users'][0]['uuid']; tp = ib.get('transport', {}); path = tp.get('path', ''); tls_on = tls.get('enabled', False)
-            obj = {"v":"2","ps":f"vm-ws-{hostname}-{suffix}","add":ip,"port":str(p),"id":u,"aid":"0","scy":"auto","net":"ws","type":"none","host":sni,"path":path,"tls":"tls" if tls_on else "","sni":sni if tls_on else "","alpn":"","fp":"","insecure":"0"}
-            links.append(('VMess WS', f"vmess://{base64.b64encode(json.dumps(obj, separators=(",",": "), ensure_ascii=False).encode()).decode()}"))
+            obj = {"v":"2","ps":"vm-ws-%s-%s" % (hostname, suffix),"add":ip,"port":str(p),"id":u,"aid":"0","scy":"auto","net":"ws","type":"none","host":sni,"path":path,"tls":"tls" if tls_on else "","sni":sni if tls_on else "","alpn":"","fp":"","insecure":"0"}
+            vmess_json = json.dumps(obj, separators=(",", ": "), ensure_ascii=False)
+            vmess_b64 = base64.b64encode(vmess_json.encode()).decode()
+            links.append(('VMess WS', "vmess://" + vmess_b64))
         elif t == 'hysteria2':
-            links.append(('Hysteria2', f"hysteria2://{ib['users'][0]['password']}@{ip}:{p}?sni={sni}&alpn=h3&insecure=1&allowInsecure=1#{lbl}"))
+            link = "hysteria2://%s@%s:%s?sni=%s&alpn=h3&insecure=1&allowInsecure=1#%s" % (ib['users'][0]['password'], ip, p, sni, lbl)
+            links.append(('Hysteria2', link))
         elif t == 'tuic':
             u = ib['users'][0]['uuid']; pw = ib['users'][0]['password']
-            links.append(('TUIC v5', f"tuic://{quote(f'{u}:{pw}', safe='')}@{ip}:{p}?sni={sni}&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#{lbl}"))
+            link = "tuic://%s@%s:%s?sni=%s&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#%s" % (quote('%s:%s' % (u, pw), safe=''), ip, p, sni, lbl)
+            links.append(('TUIC v5', link))
         elif t == 'anytls':
-            links.append(('AnyTLS', f"anytls://{ib['users'][0]['password']}@{ip}:{p}?security=tls&sni={sni}&insecure=1&allowInsecure=1&type=tcp#{lbl}"))
+            link = "anytls://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1&type=tcp#%s" % (ib['users'][0]['password'], ip, p, sni, lbl)
+            links.append(('AnyTLS', link))
     return links
 
 sections = []
 for iid, ifile, icfg, cip, ilabel, etype, eip in generated:
     ll = gen_links(icfg, cip, ilabel)
-    info = f"入口IPv4: {main_public_ipv4} → 出口IPv6: {eip}" if etype == "ipv6" else f"出口IPv4: {eip}"
-    sections.append((f"实例-{ilabel}", info, ll))
+    if etype == "ipv6":
+        info = "入口IPv4: %s → 出口IPv6: %s" % (main_public_ipv4, eip)
+    else:
+        info = "出口IPv4: %s" % eip
+    sections.append(("实例-%s" % ilabel, info, ll))
 
 for sn, si, sl in sections:
-    print(f"\n{'='*60}\n  📡 {sn}\n  {si}\n{'='*60}")
-    for n, l in sl: print(f"\n  📌 {n}:\n  {l}")
+    print("\n%s\n  📡 %s\n  %s\n%s" % ('='*60, sn, si, '='*60))
+    for n, l in sl: print("\n  📌 %s:\n  %s" % (n, l))
 
-lf = f"{CONFIG_DIR}/all-links.txt"
+lf = CONFIG_DIR + "/all-links.txt"
 with open(lf, 'w') as f:
-    f.write(f"# DO四出口 严格隔离 | {hostname}\n# IPv4: {main_public_ipv4} / {reserved_ipv4}\n# IPv6: {main_ipv6} / {reserved_ipv6}\n\n")
+    f.write("# DO四出口 严格隔离 | %s\n# IPv4: %s / %s\n# IPv6: %s / %s\n\n" % (hostname, main_public_ipv4, reserved_ipv4, main_ipv6, reserved_ipv6))
     for sn, si, sl in sections:
-        f.write(f"{'#'*60}\n# {sn}\n# {si}\n{'#'*60}\n\n")
-        for n, l in sl: f.write(f"# {n}\n{l}\n\n")
-print(f"\n💾 {lf}")
+        f.write("%s\n# %s\n# %s\n%s\n\n" % ('#'*60, sn, si, '#'*60))
+        for n, l in sl: f.write("# %s\n%s\n\n" % (n, l))
+print("\n💾 " + lf)
 
 for i, (sn, si, sl) in enumerate(sections, 1):
-    with open(f"{CONFIG_DIR}/links-instance{i}.txt", 'w') as f:
-        f.write(f"# {sn}\n# {si}\n\n")
-        for n, l in sl: f.write(f"# {n}\n{l}\n\n")
+    link_file = CONFIG_DIR + "/links-instance%d.txt" % i
+    with open(link_file, 'w') as f:
+        f.write("# %s\n# %s\n\n" % (sn, si))
+        for n, l in sl: f.write("# %s\n%s\n\n" % (n, l))
 
-with open(f"{CONFIG_DIR}/.generated_instances", 'w') as f:
+with open(CONFIG_DIR + "/.generated_instances", 'w') as f:
     for iid, ifile, _, _, ilabel, _, _ in generated:
-        if iid != "main-v4": f.write(f"{iid}|{ifile}|{ilabel}\n")
+        if iid != "main-v4": f.write("%s|%s|%s\n" % (iid, ifile, ilabel))
 
 # 验证 sb.sh 兼容性：检查关键 jq 路径
 print("\n📋 sb.sh 兼容性检查:")
 try:
-    with open(f"{CONFIG_DIR}/sb.json", 'r') as f: check = json.load(f)
+    with open(CONFIG_DIR + "/sb.json", 'r') as f: check = json.load(f)
     # 甬哥脚本读取的关键路径
     tests = [
         (".inbounds[0].users[0].uuid", check.get('inbounds', [{}])[0].get('users', [{}])[0].get('uuid')),
@@ -469,13 +458,13 @@ try:
     for path, val in tests:
         status = "✅" if val is not None else "❌"
         if val is None: all_ok = False
-        print(f"   {status} {path} = {val}")
+        print("   %s %s = %s" % (status, path, val))
     if all_ok:
         print("   ✅ 全部路径有效，sb.sh 兼容")
     else:
         print("   ⚠️  部分路径缺失，请检查")
 except Exception as e:
-    print(f"   ❌ 检查失败: {e}")
+    print("   ❌ 检查失败: %s" % e)
 PYEOF
 
 [ $? -ne 0 ] && echo "❌ 生成失败" && exit 1
