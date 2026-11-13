@@ -38,8 +38,16 @@ for svc in sing-box sing-box-reserved-v4 sing-box-ipv6 sing-box-reserved-v6 sing
     systemctl stop "$svc" 2>/dev/null || true
     [[ "$svc" != "sing-box" ]] && systemctl disable "$svc" 2>/dev/null || true
 done
-pkill -9 -f "sing-box" 2>/dev/null || true; sleep 2
+pkill -9 -x "sing-box" 2>/dev/null || true; sleep 2
 echo "   └─ ✅ 已停止"
+
+DEFAULT_IFACE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+[ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+[ -z "$DEFAULT_IFACE" ] && DEFAULT_IFACE="eth0"
+
+norm_v6() {
+    python3 -c "import ipaddress,sys; print(ipaddress.IPv6Address(sys.argv[1]).compressed)" "$1" 2>/dev/null || echo "$1"
+}
 
 echo "" && echo "🔍 查询 DigitalOcean 元数据..."
 METADATA_JSON=$(curl -sf http://169.254.169.254/metadata/v1.json 2>/dev/null) || { echo "❌ 元数据不可用"; exit 1; }
@@ -52,14 +60,16 @@ RESERVED_IPV4=$(curl -sf http://169.254.169.254/metadata/v1/reserved_ip/ipv4/ip_
 MAIN_IPV6=$(curl -sf http://169.254.169.254/metadata/v1/interfaces/public/0/ipv6/address 2>/dev/null || echo "")
 MAIN_IPV6_GATEWAY=$(curl -sf http://169.254.169.254/metadata/v1/interfaces/public/0/ipv6/gateway 2>/dev/null || echo "")
 [ -z "$MAIN_IPV6" ] && MAIN_IPV6=$(echo "$METADATA_JSON" | jq -r '(.interfaces.public // []) | if type == "array" then .[0] else . end | .ipv6 | if type == "object" then .address elif type == "array" then .[0].address else empty end // empty' 2>/dev/null || echo "")
-[ -z "$MAIN_IPV6" ] && MAIN_IPV6=$(ip -6 addr show dev eth0 scope global | grep -v "deprecated\|temporary" | grep "inet6" | head -1 | awk '{print $2}' | cut -d'/' -f1 || echo "")
+[ -z "$MAIN_IPV6" ] && MAIN_IPV6=$(ip -6 addr show dev "$DEFAULT_IFACE" scope global | grep -v "deprecated\|temporary" | grep "inet6" | head -1 | awk '{print $2}' | cut -d'/' -f1 || echo "")
 [ -z "$MAIN_IPV6_GATEWAY" ] && MAIN_IPV6_GATEWAY=$(echo "$METADATA_JSON" | jq -r '(.interfaces.public // []) | if type == "array" then .[0] else . end | .ipv6 | if type == "object" then .gateway elif type == "array" then .[0].gateway else empty end // empty' 2>/dev/null || echo "")
-[ -z "$MAIN_IPV6_GATEWAY" ] && MAIN_IPV6_GATEWAY=$(ip -6 route show default dev eth0 2>/dev/null | head -1 | awk '{print $3}' || echo "")
+[ -z "$MAIN_IPV6_GATEWAY" ] && MAIN_IPV6_GATEWAY=$(ip -6 route show default dev "$DEFAULT_IFACE" 2>/dev/null | head -1 | awk '{print $3}' || echo "")
 RESERVED_IPV6=$(curl -sf http://169.254.169.254/metadata/v1/reserved_ip/ipv6/ip_address 2>/dev/null || echo "")
 RESERVED_IPV6_ACTIVE=$(curl -sf http://169.254.169.254/metadata/v1/reserved_ip/ipv6/active 2>/dev/null || echo "")
 [ -z "$RESERVED_IPV6" ] && RESERVED_IPV6=$(echo "$METADATA_JSON" | jq -r '.reserved_ip.ipv6.ip_address // empty' 2>/dev/null || echo "")
 [ -z "$RESERVED_IPV6_ACTIVE" ] && RESERVED_IPV6_ACTIVE=$(echo "$METADATA_JSON" | jq -r '.reserved_ip.ipv6.active // empty' 2>/dev/null || echo "")
 [ -z "$MAIN_ANCHOR_IPV4" ] && MAIN_ANCHOR_IPV4=$(echo "$METADATA_JSON" | jq -r '(.interfaces.public // []) | if type == "array" then .[0] else . end | .anchor_ipv4.address // empty' 2>/dev/null || echo "")
+[ -n "$MAIN_IPV6" ] && MAIN_IPV6=$(norm_v6 "$MAIN_IPV6")
+[ -n "$RESERVED_IPV6" ] && RESERVED_IPV6=$(norm_v6 "$RESERVED_IPV6")
 HOSTNAME_LABEL=$(curl -sf http://169.254.169.254/metadata/v1/hostname 2>/dev/null | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]' || echo "NODE")
 
 echo ""
@@ -92,14 +102,14 @@ SOURCE_FILE="/etc/s-box/sb.json"
 echo "" && echo "✅ 配置: $SOURCE_FILE"
 
 echo "" && echo "⚙️  配置 IPv6 路由..."
-for ns in all default eth0 lo; do sysctl -w net.ipv6.conf.$ns.disable_ipv6=0 >/dev/null 2>&1; done
+for ns in all default "$DEFAULT_IFACE" lo; do sysctl -w net.ipv6.conf.$ns.disable_ipv6=0 >/dev/null 2>&1 || true; done
 echo "   ├─ ✅ IPv6 已启用"
 if [ "$HAS_RV6" = true ]; then
     ip -6 addr replace "${RESERVED_IPV6}/128" dev lo scope global 2>/dev/null || ip -6 addr add "${RESERVED_IPV6}/128" dev lo scope global 2>/dev/null || true
-    ip -6 addr show dev lo | grep -q "$RESERVED_IPV6" && echo "   ├─ ✅ 保留IPv6 绑定 lo" || { echo "   ├─ ❌ 绑定失败"; HAS_RV6=false; }
+    ip -6 addr show dev lo | grep -qi "$RESERVED_IPV6" && echo "   ├─ ✅ 保留IPv6 绑定 lo" || { echo "   ├─ ❌ 绑定失败"; HAS_RV6=false; }
 fi
-ip -6 addr show dev eth0 scope global | grep -q "$MAIN_IPV6" || ip -6 addr add "${MAIN_IPV6}/64" dev eth0 scope global 2>/dev/null || true
-ip -6 route show default | grep -q "default" || { [ -n "$MAIN_IPV6_GATEWAY" ] && ip -6 route add default via "$MAIN_IPV6_GATEWAY" dev eth0 2>/dev/null || true; }
+ip -6 addr show dev "$DEFAULT_IFACE" scope global | grep -qi "$MAIN_IPV6" || ip -6 addr add "${MAIN_IPV6}/64" dev "$DEFAULT_IFACE" scope global 2>/dev/null || true
+ip -6 route show default | grep -q "default" || { [ -n "$MAIN_IPV6_GATEWAY" ] && ip -6 route add default via "$MAIN_IPV6_GATEWAY" dev "$DEFAULT_IFACE" 2>/dev/null || true; }
 echo "   ├─ ✅ IPv6 路由确认"
 ping6 -c1 -W3 2606:4700:4700::1111 >/dev/null 2>&1 && echo "   ├─ ✅ IPv6 连通" || echo "   ├─ ⚠️  IPv6 ping 失败"
 mkdir -p /etc/s-box
@@ -107,7 +117,9 @@ cat > /etc/s-box/setup-ipv6-routes.sh << 'EOFP'
 #!/bin/bash
 for ns in all default lo; do sysctl -w net.ipv6.conf.$ns.disable_ipv6=0 >/dev/null 2>&1; done
 EOFP
-[ "$HAS_RV6" = true ] && echo "ip -6 addr replace \"${RESERVED_IPV6}/128\" dev lo scope global 2>/dev/null || true" >> /etc/s-box/setup-ipv6-routes.sh
+if [ "$HAS_RV6" = true ]; then
+    echo "ip -6 addr replace \"${RESERVED_IPV6}/128\" dev lo scope global 2>/dev/null || true" >> /etc/s-box/setup-ipv6-routes.sh
+fi
 chmod +x /etc/s-box/setup-ipv6-routes.sh
 cat > /etc/systemd/system/do-ipv6-routes.service << EOF
 [Unit]
@@ -124,10 +136,12 @@ EOF
 systemctl daemon-reload && systemctl enable do-ipv6-routes.service >/dev/null 2>&1
 echo "   └─ ✅ 持久化已注册"
 
+HOST_BUSY_PORTS=$(ss -H -tuln 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -E '^[0-9]+$' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
+
 # ── Python ───────────────────────────────────────────────────
 echo "" && echo "⚙️  生成配置（兼容 sb.sh）..."
 
-python3 << PYEOF
+if ! python3 << PYEOF
 import json, sys, copy, base64, os
 from urllib.parse import quote
 
@@ -141,7 +155,15 @@ hostname         = "${HOSTNAME_LABEL}"
 has_rv4          = "${HAS_RV4}" == "true"
 has_rv6          = "${HAS_RV6}" == "true"
 sb_mm            = "${SB_MM}"
+default_iface    = "${DEFAULT_IFACE}" or "eth0"
+host_busy_str    = "${HOST_BUSY_PORTS}"
 CONFIG_DIR       = "/etc/s-box"
+
+busy_ports = set()
+for p in host_busy_str.split(','):
+    p = p.strip()
+    if p.isdigit():
+        busy_ports.add(int(p))
 
 try:
     sv = sb_mm.split('.'); sb_major, sb_minor = int(sv[0]), int(sv[1])
@@ -156,6 +178,13 @@ print("   v%s | 新DNS: %s | 新路由: %s" % (sb_mm, use_new_dns, use_new_route
 with open(source_file, 'r') as f:
     original_config = json.load(f)
 print("   ✅ %d 个入站" % len(original_config.get('inbounds', [])))
+
+# 记录主实例已占用端口，避免副实例端口溢出 (>65535) 或跨实例冲突
+used_ports = set()
+for ib in original_config.get('inbounds', []):
+    p = ib.get('listen_port')
+    if isinstance(p, int):
+        used_ports.add(p)
 
 # ═══════════════════════════════════════════════════════════
 def derive_x25519_pubkey(pk):
@@ -177,8 +206,24 @@ def get_common_sni(cfg):
 def shift_ports(cfg, offset):
     for ib in cfg.get('inbounds', []):
         if 'listen_port' in ib and isinstance(ib['listen_port'], int):
-            old = ib['listen_port']; ib['listen_port'] = old + offset
-            print("      端口: %d -> %d" % (old, old + offset))
+            old = ib['listen_port']
+            target = old + offset
+            if 1 <= target <= 65535 and target not in used_ports and target not in busy_ports:
+                new_port = target
+                print("      端口: %d -> %d" % (old, new_port))
+            else:
+                new_port = None
+                candidates = list(range(min(old, 65535), 9999, -1)) + list(range(10000, 65536))
+                for cand in candidates:
+                    if cand not in used_ports and cand not in busy_ports:
+                        new_port = cand
+                        break
+                if new_port is None:
+                    raise RuntimeError("无法为端口 %d (偏移 +%d) 分配可用端口" % (old, offset))
+                reason = "超出65535" if target > 65535 else "端口冲突"
+                print("      端口: %d -> %d (原偏移 %d %s，已自动重映射)" % (old, new_port, target, reason))
+            ib['listen_port'] = new_port
+            used_ports.add(new_port)
 
 # ═══════════════════════════════════════════════════════════
 # 实例1: 在原始 sb.json 上注入严格 IPv4 约束
@@ -275,7 +320,7 @@ def build_clean_ipv4(cfg, bind_v4):
         ], "final": "direct", "auto_detect_interface": False}
         if use_new_dns: route["default_domain_resolver"] = {"server": "ipv4-dns-cf"}
         cfg['route'] = route
-    direct_ob = {"type": "direct", "tag": "direct", "bind_interface": "eth0",
+    direct_ob = {"type": "direct", "tag": "direct", "bind_interface": default_iface,
         "inet4_bind_address": bind_v4, "bind_address_no_port": True,
         "tcp_multi_path": False, "tcp_fast_open": False, "udp_fragment": True}
     if use_new_dns: direct_ob["domain_resolver"] = "ipv4-dns-cf"
@@ -310,7 +355,7 @@ def build_clean_ipv6(cfg, bind_v6):
         ], "final": "direct", "auto_detect_interface": False}
         if use_new_dns: route["default_domain_resolver"] = {"server": "ipv6-dns-cf"}
         cfg['route'] = route
-    direct_ob = {"type": "direct", "tag": "direct", "bind_interface": "eth0",
+    direct_ob = {"type": "direct", "tag": "direct", "bind_interface": default_iface,
         "inet6_bind_address": bind_v6, "bind_address_no_port": True,
         "tcp_multi_path": False, "tcp_fast_open": False, "udp_fragment": True}
     if use_new_dns: direct_ob["domain_resolver"] = "ipv6-dns-cf"
@@ -385,7 +430,7 @@ def gen_links(cfg, ip, suffix):
         tls = ib.get('tls', {}); sni = tls.get('server_name', common_sni) or common_sni
         if t == 'vless':
             u = ib['users'][0]['uuid']; fl = ib['users'][0].get('flow', 'xtls-rprx-vision')
-            r = tls.get('reality', {}); pk = r.get('private_key', ''); sid = r.get('short_id', [''])[0]
+            r = tls.get('reality', {}); pk = r.get('private_key', ''); sid = (r.get('short_id') or [''])[0]
             pbk = derive_x25519_pubkey(pk) if pk else ''
             link = "vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s" % (u, ip, p, fl, sni, pbk, sid, lbl)
             links.append(('VLESS Reality', link))
@@ -442,18 +487,23 @@ with open(CONFIG_DIR + "/.generated_instances", 'w') as f:
 print("\n📋 sb.sh 兼容性检查:")
 try:
     with open(CONFIG_DIR + "/sb.json", 'r') as f: check = json.load(f)
+    ibs = check.get('inbounds', [])
+    obs = check.get('outbounds', [])
+    def idx(lst, i): return lst[i] if i < len(lst) and isinstance(lst[i], dict) else {}
     # 甬哥脚本读取的关键路径
     tests = [
-        (".inbounds[0].users[0].uuid", check.get('inbounds', [{}])[0].get('users', [{}])[0].get('uuid')),
-        (".inbounds[0].listen_port", check.get('inbounds', [{}])[0].get('listen_port')),
-        (".inbounds[1].listen_port", check.get('inbounds', [{},{}])[1].get('listen_port')),
-        (".inbounds[1].tls.enabled", check.get('inbounds', [{},{}])[1].get('tls', {}).get('enabled')),
-        (".inbounds[2].listen_port", check.get('inbounds', [{},{},{}])[2].get('listen_port')),
-        (".inbounds[3].listen_port", check.get('inbounds', [{},{},{},{}])[3].get('listen_port')),
-        (".outbounds[0].type", check.get('outbounds', [{}])[0].get('type')),
-        (".outbounds[1].type", check.get('outbounds', [{},{}])[1].get('type')),
+        (".inbounds[0].users[0].uuid", (idx(ibs, 0).get('users') or [{}])[0].get('uuid')),
+        (".inbounds[0].listen_port", idx(ibs, 0).get('listen_port')),
+        (".inbounds[1].listen_port", idx(ibs, 1).get('listen_port')),
+        (".inbounds[1].tls.enabled", idx(ibs, 1).get('tls', {}).get('enabled')),
+        (".inbounds[2].listen_port", idx(ibs, 2).get('listen_port')),
+        (".inbounds[3].listen_port", idx(ibs, 3).get('listen_port')),
+        (".outbounds[0].type", idx(obs, 0).get('type')),
+        (".outbounds[1].type", idx(obs, 1).get('type')),
         (".route.rules count", len(check.get('route', {}).get('rules', []))),
     ]
+    if len(ibs) > 4:
+        tests.insert(6, (".inbounds[4].listen_port", idx(ibs, 4).get('listen_port')))
     all_ok = True
     for path, val in tests:
         status = "✅" if val is not None else "❌"
@@ -466,8 +516,10 @@ try:
 except Exception as e:
     print("   ❌ 检查失败: %s" % e)
 PYEOF
-
-[ $? -ne 0 ] && echo "❌ 生成失败" && exit 1
+then
+    echo "❌ 生成失败"
+    exit 1
+fi
 
 # ── systemd ──────────────────────────────────────────────────
 echo "" && echo "⚙️  systemd 服务..."
@@ -487,23 +539,28 @@ echo "   └─ sing-box.service (主IPv4 sb.json)"
 echo "" && echo "🔍 验证配置..."
 ALL_OK=true
 if $SINGBOX_BIN check -c /etc/s-box/sb.json 2>/dev/null; then echo "   ├─ ✅ 主IPv4 (sb.json)"
-else echo "   ├─ ❌ 主IPv4 (sb.json)"; $SINGBOX_BIN check -c /etc/s-box/sb.json 2>&1 | head -5 | sed 's/^/   │  /'; ALL_OK=false; fi
+else echo "   ├─ ❌ 主IPv4 (sb.json)"; $SINGBOX_BIN check -c /etc/s-box/sb.json 2>&1 | head -5 | sed 's/^/   │  /' || true; ALL_OK=false; fi
 if [ -f "$INST_INFO" ]; then
     while IFS='|' read -r ID FILE LABEL; do
         if $SINGBOX_BIN check -c "$FILE" 2>/dev/null; then echo "   ├─ ✅ $LABEL ($(basename $FILE))"
-        else echo "   ├─ ❌ $LABEL ($(basename $FILE))"; $SINGBOX_BIN check -c "$FILE" 2>&1 | head -5 | sed 's/^/   │  /'; ALL_OK=false; fi
+        else echo "   ├─ ❌ $LABEL ($(basename $FILE))"; $SINGBOX_BIN check -c "$FILE" 2>&1 | head -5 | sed 's/^/   │  /' || true; ALL_OK=false; fi
     done < "$INST_INFO"
 fi
 
 echo "" && echo "🚀 启动全部服务..."
 systemctl daemon-reload
-systemctl enable sing-box >/dev/null 2>&1; systemctl restart sing-box 2>/dev/null; sleep 2
-systemctl is-active --quiet sing-box && echo "   ├─ ✅ sing-box (主IPv4) - 运行中" || { echo "   ├─ ❌ sing-box (主IPv4) - 失败"; journalctl -u sing-box --no-pager -n 5 2>/dev/null | sed 's/^/   │  /'; }
+systemctl enable sing-box >/dev/null 2>&1 || true; systemctl restart sing-box 2>/dev/null || true; sleep 2
+systemctl is-active --quiet sing-box && echo "   ├─ ✅ sing-box (主IPv4) - 运行中" || { echo "   ├─ ❌ sing-box (主IPv4) - 失败"; journalctl -u sing-box --no-pager -n 5 2>/dev/null | sed 's/^/   │  /' || true; }
 if [ -f "$INST_INFO" ]; then
     while IFS='|' read -r ID FILE LABEL; do
-        SVC="sing-box-${ID}"; systemctl enable "$SVC" >/dev/null 2>&1; systemctl restart "$SVC" 2>/dev/null; sleep 2
-        systemctl is-active --quiet "$SVC" && echo "   ├─ ✅ $SVC ($LABEL) - 运行中" || { echo "   ├─ ❌ $SVC ($LABEL) - 失败"; journalctl -u "$SVC" --no-pager -n 5 2>/dev/null | sed 's/^/   │  /'; }
+        SVC="sing-box-${ID}"; systemctl enable "$SVC" >/dev/null 2>&1 || true; systemctl restart "$SVC" 2>/dev/null || true; sleep 2
+        systemctl is-active --quiet "$SVC" && echo "   ├─ ✅ $SVC ($LABEL) - 运行中" || { echo "   ├─ ❌ $SVC ($LABEL) - 失败"; journalctl -u "$SVC" --no-pager -n 5 2>/dev/null | sed 's/^/   │  /' || true; }
     done < "$INST_INFO"
+fi
+
+if [ "$ALL_OK" = false ]; then
+    echo ""
+    echo "⚠️  警告: 部分实例配置验证未通过，请检查上方 ❌ 错误信息！"
 fi
 
 echo "" && echo "🔍 出口验证..."
