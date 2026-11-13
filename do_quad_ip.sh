@@ -329,16 +329,32 @@ def build_clean_ipv4(cfg, bind_v4):
     return cfg
 
 def build_clean_ipv6(cfg, bind_v6):
-    for ib in cfg.get('inbounds', []): ib['listen'] = '0.0.0.0'
+    has_reality = False
+    for ib in cfg.get('inbounds', []):
+        ib['listen'] = '0.0.0.0'
+        if use_new_dns and ib.get('type') == 'vless':
+            reality = ib.get('tls', {}).get('reality', {})
+            if reality.get('enabled') and isinstance(reality.get('handshake'), dict):
+                # Reality 伪装握手域名可能只有 IPv4 (如 developer.nvidia.com)，仅为其指定独立解析器，不影响代理出站纯 IPv6 隔离
+                reality['handshake']['domain_resolver'] = {
+                    "server": "reality-dns",
+                    "strategy": "prefer_ipv6"
+                }
+                has_reality = True
     if use_new_dns:
+        servers = [
+            {"tag": "ipv6-dns-cf", "type": "tls", "server": "2606:4700:4700::1111", "server_port": 853},
+            {"tag": "ipv6-dns-google", "type": "tls", "server": "2001:4860:4860::8888", "server_port": 853}
+        ]
+        if has_reality:
+            servers.append({"tag": "reality-dns", "type": "tls", "server": "1.1.1.1", "server_port": 853})
         cfg['dns'] = {
-            "servers": [
-                {"tag": "ipv6-dns-cf", "type": "tls", "server": "2606:4700:4700::1111", "server_port": 853},
-                {"tag": "ipv6-dns-google", "type": "tls", "server": "2001:4860:4860::8888", "server_port": 853}
-            ],
+            "servers": servers,
             "final": "ipv6-dns-cf", "strategy": "ipv6_only",
-            "disable_cache": False, "independent_cache": True
+            "disable_cache": False
         }
+        if sb_major == 1 and sb_minor < 14:
+            cfg['dns']["independent_cache"] = True
     else:
         cfg['dns'] = {
             "servers": [
