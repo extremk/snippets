@@ -1,7 +1,6 @@
 #!/bin/bash
 # ====================================================
-# DigitalOcean 双开保留 IP 一键配置脚本 (适配 Ubuntu 20.04/22.04/24.04)
-# 兼容 Python 3.8+ (不使用 f-string，确保旧系统兼容)
+# DigitalOcean 双开保留 IP 一键配置脚本 (适配 Ubuntu 24.04)
 # 作用: 自动读取 DO Anchor IP，端口自动+1，绑定出站网卡，注册双开服务，生成订阅链接
 # ====================================================
 
@@ -48,32 +47,86 @@ if [ ! -f "$SOURCE_FILE" ]; then
     exit 1
 fi
 
-# 4. 生成 sb-reserved.json（端口+1，绑定出站网卡）
+# 4. 停止旧的副实例服务，收集已占用端口并生成 sb-reserved.json
+systemctl stop sing-box-reserved 2>/dev/null || true
+HOST_BUSY_PORTS=$(ss -H -tuln 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -E '^[0-9]+$' | sort -nu | tr '\n' ',' | sed 's/,$//' || true)
+
+SINGBOX_BIN=""
+if [ -x /etc/s-box/sing-box ]; then
+    SINGBOX_BIN="/etc/s-box/sing-box"
+elif command -v sing-box &>/dev/null; then
+    SINGBOX_BIN=$(command -v sing-box)
+fi
+SB_MM=""
+if [ -n "$SINGBOX_BIN" ]; then
+    SB_MM=$($SINGBOX_BIN version 2>/dev/null | awk '/version/{print $NF}' | cut -d'.' -f1,2 || echo "")
+fi
+
 echo ""
 echo "⚙️  正在生成端口+1并绑定 $ANCHOR_IP 的专属配置文件..."
 
-python3 - "$SOURCE_FILE" "$TARGET_FILE" "$ANCHOR_IP" <<'PYEOF'
+python3 - "$SOURCE_FILE" "$TARGET_FILE" "$ANCHOR_IP" "$HOST_BUSY_PORTS" "$SB_MM" <<'PYEOF'
 import json
 import sys
 
-source_file = sys.argv[1]
-target_file = sys.argv[2]
-anchor_ip   = sys.argv[3]
+source_file   = sys.argv[1]
+target_file   = sys.argv[2]
+anchor_ip     = sys.argv[3]
+host_busy_str = sys.argv[4] if len(sys.argv) > 4 else ""
+sb_mm         = sys.argv[5] if len(sys.argv) > 5 else ""
+
+busy_ports = set()
+for p in host_busy_str.split(','):
+    p = p.strip()
+    if p.isdigit():
+        busy_ports.add(int(p))
+
+use_bind_no_port = False
+try:
+    sv = sb_mm.split('.')
+    if len(sv) >= 2:
+        maj, min_v = int(sv[0]), int(sv[1])
+        use_bind_no_port = (maj > 1) or (maj == 1 and min_v >= 13)
+except Exception:
+    pass
 
 try:
     with open(source_file, 'r', encoding='utf-8') as f:
         config = json.load(f)
 except Exception as e:
-    print('❌ 解析 JSON 失败: %s' % e)
+    print(f'❌ 解析 JSON 失败: {e}')
     sys.exit(1)
 
-# 端口 + 1
+# 记录主实例已占用端口，防止 +1 超过 65535 或与主实例/系统端口冲突
+used_ports = set()
+for inbound in config.get('inbounds', []):
+    p = inbound.get('listen_port')
+    if isinstance(p, int):
+        used_ports.add(p)
+
+# 端口 + 1（带溢出和冲突自动重映射）
 if 'inbounds' in config:
     for inbound in config['inbounds']:
         if 'listen_port' in inbound and isinstance(inbound['listen_port'], int):
             old_port = inbound['listen_port']
-            inbound['listen_port'] = old_port + 1
-            print("✅ 端口自动修改成功: %d -> %d" % (old_port, inbound['listen_port']))
+            target_port = old_port + 1
+            if 1 <= target_port <= 65535 and target_port not in used_ports and target_port not in busy_ports:
+                new_port = target_port
+                print(f"✅ 端口自动修改成功: {old_port} -> {new_port}")
+            else:
+                new_port = None
+                candidates = list(range(min(old_port, 65535), 9999, -1)) + list(range(10000, 65536))
+                for cand in candidates:
+                    if cand not in used_ports and cand not in busy_ports:
+                        new_port = cand
+                        break
+                if new_port is None:
+                    print(f"❌ 无法为端口 {old_port} (+1) 分配可用端口")
+                    sys.exit(1)
+                reason = "超出65535" if target_port > 65535 else "端口冲突"
+                print(f"⚠️  端口自动重映射: {old_port} -> {new_port} (原偏移 {target_port} {reason})")
+            inbound['listen_port'] = new_port
+            used_ports.add(new_port)
 
 # 绑定网卡与 UDP 优化
 if 'outbounds' in config:
@@ -82,7 +135,9 @@ if 'outbounds' in config:
         if outbound.get('tag') == 'direct' and outbound.get('type') == 'direct':
             outbound['inet4_bind_address'] = anchor_ip
             outbound['udp_fragment'] = True
-            print("✅ 出站网卡绑定成功: 锁定至 %s" % anchor_ip)
+            if use_bind_no_port:
+                outbound['bind_address_no_port'] = True
+            print(f"✅ 出站网卡绑定成功: 锁定至 {anchor_ip}")
             modified = True
             break
     if not modified:
@@ -117,7 +172,7 @@ try:
     with open(config_file, 'r', encoding='utf-8') as f:
         config = json.load(f)
 except Exception as e:
-    print('❌ 解析配置文件失败: %s' % e)
+    print(f'❌ 解析配置文件失败: {e}')
     sys.exit(1)
 
 # ── 从 X25519 私钥推导公钥（用于 VLESS Reality pbk 参数）──────────────
@@ -131,7 +186,7 @@ def derive_x25519_pubkey(private_key_b64url):
         pub_raw = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         return base64.urlsafe_b64encode(pub_raw).rstrip(b'=').decode()
     except Exception as e:
-        print("⚠️  公钥推导失败（%s），pbk 将留空，请手动填写。" % e)
+        print(f"⚠️  公钥推导失败（{e}），pbk 将留空，请手动填写。")
         return ""
 
 # ── 查找通用 SNI（取 vmess 的 server_name，用于其他协议兜底）─────────────
@@ -149,7 +204,7 @@ for inbound in config.get('inbounds', []):
     itype = inbound.get('type')
     port  = inbound.get('listen_port')
     tag   = inbound.get('tag', '').replace('-sb', '')
-    label = "%s-%s-备用IP" % (tag, hostname)
+    label = f"{tag}-{hostname}-备用IP"
     tls   = inbound.get('tls', {})
     sni   = tls.get('server_name', common_sni) or common_sni
 
@@ -159,14 +214,14 @@ for inbound in config.get('inbounds', []):
         flow     = inbound['users'][0].get('flow', 'xtls-rprx-vision')
         reality  = tls.get('reality', {})
         priv_key = reality.get('private_key', '')
-        short_id = reality.get('short_id', [''])[0]
+        short_id = (reality.get('short_id') or [''])[0]
         pbk      = derive_x25519_pubkey(priv_key)
         link = (
-            "vless://%s@%s:%s"
-            "?encryption=none&flow=%s&security=reality"
-            "&sni=%s&fp=chrome&pbk=%s&sid=%s"
-            "&type=tcp&headerType=none#%s"
-        ) % (uuid, public_ip, port, flow, sni, pbk, short_id, label)
+            f"vless://{uuid}@{public_ip}:{port}"
+            f"?encryption=none&flow={flow}&security=reality"
+            f"&sni={sni}&fp=chrome&pbk={pbk}&sid={short_id}"
+            f"&type=tcp&headerType=none#{label}"
+        )
         links.append(('VLESS Reality', link))
 
     # ── VMess WS ───────────────────────────────────────────────────────
@@ -177,7 +232,7 @@ for inbound in config.get('inbounds', []):
         tls_on    = tls.get('enabled', False)
         vmess_obj = {
             "v":        "2",
-            "ps":       "vm-ws-%s-备用IP" % hostname,
+            "ps":       f"vm-ws-{hostname}-备用IP",
             "add":      public_ip,
             "port":     str(port),
             "id":       uuid,
@@ -193,60 +248,61 @@ for inbound in config.get('inbounds', []):
             "fp":       "",
             "insecure": "0"
         }
-        vmess_json = json.dumps(vmess_obj, separators=(',', ': '), ensure_ascii=False)
-        encoded = base64.b64encode(vmess_json.encode()).decode()
-        links.append(('VMess WS', "vmess://" + encoded))
+        encoded = base64.b64encode(
+            json.dumps(vmess_obj, separators=(',', ': '), ensure_ascii=False).encode()
+        ).decode()
+        links.append(('VMess WS', f"vmess://{encoded}"))
 
     # ── Hysteria2 ──────────────────────────────────────────────────────
     elif itype == 'hysteria2':
         password = inbound['users'][0]['password']
         link = (
-            "hysteria2://%s@%s:%s"
-            "?sni=%s&alpn=h3&insecure=1&allowInsecure=1#%s"
-        ) % (password, public_ip, port, sni, label)
+            f"hysteria2://{password}@{public_ip}:{port}"
+            f"?sni={sni}&alpn=h3&insecure=1&allowInsecure=1#{label}"
+        )
         links.append(('Hysteria2', link))
 
     # ── TUIC v5 ────────────────────────────────────────────────────────
     elif itype == 'tuic':
         uuid     = inbound['users'][0]['uuid']
         password = inbound['users'][0]['password']
-        auth     = quote("%s:%s" % (uuid, password), safe='')
+        auth     = quote(f"{uuid}:{password}", safe='')
         link = (
-            "tuic://%s@%s:%s"
-            "?sni=%s&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#%s"
-        ) % (auth, public_ip, port, sni, label)
+            f"tuic://{auth}@{public_ip}:{port}"
+            f"?sni={sni}&alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#{label}"
+        )
         links.append(('TUIC v5', link))
 
     # ── AnyTLS ─────────────────────────────────────────────────────────
     elif itype == 'anytls':
         password = inbound['users'][0]['password']
         link = (
-            "anytls://%s@%s:%s"
-            "?security=tls&sni=%s&insecure=1&allowInsecure=1&type=tcp#%s"
-        ) % (password, public_ip, port, sni, label)
+            f"anytls://{password}@{public_ip}:{port}"
+            f"?security=tls&sni={sni}&insecure=1&allowInsecure=1&type=tcp#{label}"
+        )
         links.append(('AnyTLS', link))
 
 # ── 输出 ───────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("  📡 Reserved IP: %s  |  节点标签: %s" % (public_ip, hostname))
-print("=" * 60)
+print(f"\n{'='*60}")
+print(f"  📡 Reserved IP: {public_ip}  |  节点标签: {hostname}")
+print(f"{'='*60}")
 
 all_links_text = []
 for name, link in links:
-    print("\n📌 %s:" % name)
+    print(f"\n📌 {name}:")
     print(link)
-    all_links_text.append("# %s\n%s" % (name, link))
+    all_links_text.append(f"# {name}\n{link}")
 
-print("\n" + "-" * 60)
+print(f"\n{'─'*60}")
 
 # 保存到文件
 with open(links_file, 'w', encoding='utf-8') as f:
     f.write("# 保留 IP 节点订阅链接\n")
-    f.write("# Reserved IP: %s\n\n" % public_ip)
+    f.write(f"# Reserved IP: {public_ip}\n\n")
     f.write("\n\n".join(all_links_text))
     f.write("\n")
 
-print("💾 订阅链接已保存至: %s" % links_file)
+print(f"💾 订阅链接已保存至: {links_file}")
 PYEOF
 
 if [ $? -ne 0 ]; then
@@ -267,10 +323,27 @@ fi
 
 sed 's/sb\.json/sb-reserved.json/g' "$SERVICE_SOURCE" > "$SERVICE_TARGET"
 
-# 7. 重载并启动服务
+# 7. 验证配置并重载启动服务
+if [ -n "$SINGBOX_BIN" ]; then
+    echo ""
+    echo "🔍 验证配置..."
+    if ! $SINGBOX_BIN check -c "$TARGET_FILE"; then
+        echo "❌ 配置文件校验失败: $TARGET_FILE"
+        exit 1
+    fi
+    echo "✅ 配置校验通过"
+fi
+
 systemctl daemon-reload
-systemctl enable sing-box-reserved
-systemctl restart sing-box-reserved
+systemctl enable sing-box-reserved >/dev/null 2>&1 || true
+systemctl restart sing-box-reserved || true
+sleep 2
+
+if ! systemctl is-active --quiet sing-box-reserved; then
+    echo "❌ sing-box-reserved 启动失败，最近日志："
+    journalctl -u sing-box-reserved --no-pager -n 10 2>/dev/null || true
+    exit 1
+fi
 
 echo ""
 echo "============================================="
@@ -278,6 +351,6 @@ echo "🎉 全部完成！保留 IP 双开实例已启动！"
 echo "---------------------------------------------"
 echo "📡 Reserved IP : $RESERVED_IP"
 echo "🔗 订阅链接文件: $LINKS_FILE"
-echo "👉 副节点端口已全部自动 +1"
+echo "👉 副节点端口已优先自动 +1（如超出 65535 或冲突已自动重映射）"
 echo "👉 主节点重置后，重新运行此脚本一键恢复"
 echo "============================================="
